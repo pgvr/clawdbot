@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-WORKSPACE_DIR="/home/node/clawd"
-CONFIG_DIR="/home/node/.clawdbot"
+WORKSPACE_DIR="${HOME}/clawd"
+CONFIG_DIR="${HOME}/.clawdbot"
 
 echo "=== Railway Startup ==="
 echo "PORT: ${PORT:-not set}"
