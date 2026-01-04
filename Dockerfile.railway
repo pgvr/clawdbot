@@ -14,9 +14,10 @@ RUN pnpm build
 RUN pnpm ui:install
 RUN pnpm ui:build
 
-# Create node user home directories
+# Create node user home directories and fix permissions
 RUN mkdir -p /home/node/.clawdbot /home/node/clawd && \
-    chown -R node:node /home/node
+    chown -R node:node /home/node && \
+    chown -R node:node /app
 
 ENV NODE_ENV=production
 ENV HOME=/home/node
