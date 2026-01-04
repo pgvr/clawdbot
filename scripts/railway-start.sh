@@ -4,8 +4,18 @@ set -e
 WORKSPACE_DIR="/home/node/clawd"
 CONFIG_DIR="/home/node/.clawdbot"
 
+echo "=== Railway Startup ==="
+echo "PORT: ${PORT:-not set}"
+echo "WORKSPACE_REPO: ${WORKSPACE_REPO:-not set}"
+
 # Ensure config directory exists
 mkdir -p "$CONFIG_DIR"
+
+# Create minimal config if none exists
+if [ ! -f "$CONFIG_DIR/clawdbot.json" ]; then
+  echo "Creating minimal config..."
+  echo '{}' > "$CONFIG_DIR/clawdbot.json"
+fi
 
 # Clone or pull workspace repo
 if [ -n "$WORKSPACE_REPO" ]; then
@@ -22,7 +32,13 @@ if [ -n "$WORKSPACE_REPO" ]; then
   cd "$WORKSPACE_DIR"
   git config user.email "jarvis@clawd.bot"
   git config user.name "Jarvis"
+else
+  # Create empty workspace if no repo
+  mkdir -p "$WORKSPACE_DIR"
 fi
 
-# Start the gateway
-exec node dist/index.js gateway --bind lan --port ${PORT:-18789}
+cd /app
+
+# Start the gateway - use Railway's PORT
+echo "Starting gateway on port ${PORT:-18789}..."
+exec node dist/index.js gateway --bind 0.0.0.0 --port ${PORT:-18789}

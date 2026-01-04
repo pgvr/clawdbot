@@ -5,3 +5,4 @@ dockerfilePath = "Dockerfile.railway"
 healthcheckPath = "/"
 healthcheckTimeout = 300
 restartPolicyType = "always"
+numReplicas = 1
