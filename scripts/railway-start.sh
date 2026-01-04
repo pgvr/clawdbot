@@ -41,4 +41,4 @@ cd /app
 
 # Start the gateway - use Railway's PORT
 echo "Starting gateway on port ${PORT:-18789}..."
-exec node dist/index.js gateway --bind 0.0.0.0 --port ${PORT:-18789}
+exec node dist/index.js gateway --bind 0.0.0.0 --port ${PORT:-18789} --allow-unconfigured
