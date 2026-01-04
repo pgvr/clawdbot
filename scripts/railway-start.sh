@@ -23,8 +23,16 @@ if [ -n "$WORKSPACE_REPO" ]; then
     echo "Pulling latest workspace..."
     cd "$WORKSPACE_DIR"
     git pull --ff-only || true
+  elif [ -d "$WORKSPACE_DIR" ] && [ "$(ls -A $WORKSPACE_DIR 2>/dev/null)" ]; then
+    echo "Workspace dir exists but isn't a git repo - reinitializing..."
+    cd "$WORKSPACE_DIR"
+    git init
+    git remote add origin "$WORKSPACE_REPO"
+    git fetch origin
+    git reset --hard origin/main || git reset --hard origin/master
   else
     echo "Cloning workspace repo..."
+    rm -rf "$WORKSPACE_DIR" 2>/dev/null || true
     git clone "$WORKSPACE_REPO" "$WORKSPACE_DIR"
   fi
   
