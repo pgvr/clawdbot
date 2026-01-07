@@ -334,6 +334,15 @@ Run multiple isolated agents (separate workspace, `agentDir`, sessions) inside o
   - `workspace`: default `~/clawd-<agentId>` (for `main`, falls back to legacy `agent.workspace`).
   - `agentDir`: default `~/.clawdbot/agents/<agentId>/agent`.
   - `model`: per-agent default model (provider/model), overrides `agent.model` for that agent.
+  - `sandbox`: per-agent sandbox config (overrides `agent.sandbox`).
+    - `mode`: `"off"` | `"non-main"` | `"all"`
+    - `workspaceAccess`: `"none"` | `"ro"` | `"rw"`
+    - `scope`: `"session"` | `"agent"` | `"shared"`
+    - `workspaceRoot`: custom sandbox workspace root
+    - `tools`: per-agent sandbox tool policy (deny wins; overrides `agent.sandbox.tools`)
+  - `tools`: per-agent tool restrictions (applied before sandbox tool policy).
+    - `allow`: array of allowed tool names
+    - `deny`: array of denied tool names (deny wins)
 - `routing.bindings[]`: routes inbound messages to an `agentId`.
   - `match.provider` (required)
   - `match.accountId` (optional; `*` = any account; omitted = default account)
@@ -817,6 +826,7 @@ Block streaming:
     }
   }
   ```
+See [/concepts/streaming](/concepts/streaming) for behavior + chunking details.
 
 `agent.model.primary` should be set as `provider/model` (e.g. `anthropic/claude-opus-4-5`).
 Aliases come from `agent.models.*.alias` (e.g. `Opus`).
