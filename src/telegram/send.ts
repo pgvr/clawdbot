@@ -2,6 +2,7 @@
 import { Bot, InputFile } from "grammy";
 import { formatErrorMessage } from "../infra/errors.js";
 import { mediaKindFromMime } from "../media/constants.js";
+import { isGifMedia } from "../media/mime.js";
 import { loadWebMedia } from "../web/media.js";
 
 type TelegramSendOpts = {
@@ -9,12 +10,19 @@ type TelegramSendOpts = {
   verbose?: boolean;
   mediaUrl?: string;
   maxBytes?: number;
+  messageThreadId?: number;
   api?: Bot["api"];
 };
 
 type TelegramSendResult = {
   messageId: string;
   chatId: string;
+};
+
+type TelegramReactionOpts = {
+  token?: string;
+  api?: Bot["api"];
+  remove?: boolean;
 };
 
 const PARSE_ERR_RE =
@@ -56,6 +64,21 @@ function normalizeChatId(to: string): string {
   return normalized;
 }
 
+function normalizeMessageId(raw: string | number): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.trunc(raw);
+  }
+  if (typeof raw === "string") {
+    const value = raw.trim();
+    if (!value) {
+      throw new Error("Message id is required for Telegram reactions");
+    }
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  throw new Error("Message id is required for Telegram reactions");
+}
+
 export async function sendMessageTelegram(
   to: string,
   text: string,
@@ -66,6 +89,10 @@ export async function sendMessageTelegram(
   const bot = opts.api ? null : new Bot(token);
   const api = opts.api ?? bot?.api;
   const mediaUrl = opts.mediaUrl?.trim();
+  const threadParams =
+    typeof opts.messageThreadId === "number"
+      ? { message_thread_id: Math.trunc(opts.messageThreadId) }
+      : undefined;
 
   const sleep = (ms: number) =>
     new Promise((resolve) => setTimeout(resolve, ms));
@@ -110,40 +137,53 @@ export async function sendMessageTelegram(
   if (mediaUrl) {
     const media = await loadWebMedia(mediaUrl, opts.maxBytes);
     const kind = mediaKindFromMime(media.contentType ?? undefined);
-    const file = new InputFile(
-      media.buffer,
-      media.fileName ?? inferFilename(kind) ?? "file",
-    );
+    const isGif = isGifMedia({
+      contentType: media.contentType,
+      fileName: media.fileName,
+    });
+    const fileName =
+      media.fileName ??
+      (isGif ? "animation.gif" : inferFilename(kind)) ??
+      "file";
+    const file = new InputFile(media.buffer, fileName);
     const caption = text?.trim() || undefined;
     let result:
       | Awaited<ReturnType<typeof api.sendPhoto>>
       | Awaited<ReturnType<typeof api.sendVideo>>
       | Awaited<ReturnType<typeof api.sendAudio>>
+      | Awaited<ReturnType<typeof api.sendAnimation>>
       | Awaited<ReturnType<typeof api.sendDocument>>;
-    if (kind === "image") {
+    if (isGif) {
       result = await sendWithRetry(
-        () => api.sendPhoto(chatId, file, { caption }),
+        () => api.sendAnimation(chatId, file, { caption, ...threadParams }),
+        "animation",
+      ).catch((err) => {
+        throw wrapChatNotFound(err);
+      });
+    } else if (kind === "image") {
+      result = await sendWithRetry(
+        () => api.sendPhoto(chatId, file, { caption, ...threadParams }),
         "photo",
       ).catch((err) => {
         throw wrapChatNotFound(err);
       });
     } else if (kind === "video") {
       result = await sendWithRetry(
-        () => api.sendVideo(chatId, file, { caption }),
+        () => api.sendVideo(chatId, file, { caption, ...threadParams }),
         "video",
       ).catch((err) => {
         throw wrapChatNotFound(err);
       });
     } else if (kind === "audio") {
       result = await sendWithRetry(
-        () => api.sendAudio(chatId, file, { caption }),
+        () => api.sendAudio(chatId, file, { caption, ...threadParams }),
         "audio",
       ).catch((err) => {
         throw wrapChatNotFound(err);
       });
     } else {
       result = await sendWithRetry(
-        () => api.sendDocument(chatId, file, { caption }),
+        () => api.sendDocument(chatId, file, { caption, ...threadParams }),
         "document",
       ).catch((err) => {
         throw wrapChatNotFound(err);
@@ -157,7 +197,11 @@ export async function sendMessageTelegram(
     throw new Error("Message must be non-empty for Telegram sends");
   }
   const res = await sendWithRetry(
-    () => api.sendMessage(chatId, text, { parse_mode: "Markdown" }),
+    () =>
+      api.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        ...threadParams,
+      }),
     "message",
   ).catch(async (err) => {
     // Telegram rejects malformed Markdown (e.g., unbalanced '_' or '*').
@@ -170,7 +214,10 @@ export async function sendMessageTelegram(
         );
       }
       return await sendWithRetry(
-        () => api.sendMessage(chatId, text),
+        () =>
+          threadParams
+            ? api.sendMessage(chatId, text, threadParams)
+            : api.sendMessage(chatId, text),
         "message-plain",
       ).catch((err2) => {
         throw wrapChatNotFound(err2);
@@ -180,6 +227,28 @@ export async function sendMessageTelegram(
   });
   const messageId = String(res?.message_id ?? "unknown");
   return { messageId, chatId: String(res?.chat?.id ?? chatId) };
+}
+
+export async function reactMessageTelegram(
+  chatIdInput: string | number,
+  messageIdInput: string | number,
+  emoji: string,
+  opts: TelegramReactionOpts = {},
+): Promise<{ ok: true }> {
+  const token = resolveToken(opts.token);
+  const chatId = normalizeChatId(String(chatIdInput));
+  const messageId = normalizeMessageId(messageIdInput);
+  const bot = opts.api ? null : new Bot(token);
+  const api = opts.api ?? bot?.api;
+  const remove = opts.remove === true;
+  const trimmedEmoji = emoji.trim();
+  const reactions =
+    remove || !trimmedEmoji ? [] : [{ type: "emoji", emoji: trimmedEmoji }];
+  if (typeof api.setMessageReaction !== "function") {
+    throw new Error("Telegram reactions are unavailable in this bot API.");
+  }
+  await api.setMessageReaction(chatId, messageId, reactions);
+  return { ok: true };
 }
 
 function inferFilename(kind: ReturnType<typeof mediaKindFromMime>) {

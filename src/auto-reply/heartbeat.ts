@@ -1,6 +1,14 @@
 import { HEARTBEAT_TOKEN } from "./tokens.js";
 
-export const HEARTBEAT_PROMPT = "HEARTBEAT";
+export const HEARTBEAT_PROMPT =
+  "Read HEARTBEAT.md if exists. Consider outstanding tasks. Checkup sometimes on your human during (user local) day time.";
+export const DEFAULT_HEARTBEAT_EVERY = "30m";
+export const DEFAULT_HEARTBEAT_ACK_MAX_CHARS = 30;
+
+export function resolveHeartbeatPrompt(raw?: string): string {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed || HEARTBEAT_PROMPT;
+}
 
 export type StripHeartbeatMode = "heartbeat" | "message";
 
@@ -44,7 +52,10 @@ export function stripHeartbeatToken(
   if (!trimmed) return { shouldSkip: true, text: "", didStrip: false };
 
   const mode: StripHeartbeatMode = opts.mode ?? "message";
-  const maxAckChars = Math.max(0, opts.maxAckChars ?? 30);
+  const maxAckChars = Math.max(
+    0,
+    opts.maxAckChars ?? DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
+  );
 
   if (!trimmed.includes(HEARTBEAT_TOKEN)) {
     return { shouldSkip: false, text: trimmed, didStrip: false };

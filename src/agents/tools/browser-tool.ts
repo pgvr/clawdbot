@@ -97,99 +97,45 @@ const BrowserActSchema = Type.Union([
   }),
 ]);
 
-const BrowserToolSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("status"),
-    controlUrl: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("start"),
-    controlUrl: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("stop"),
-    controlUrl: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("tabs"),
-    controlUrl: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("open"),
-    controlUrl: Type.Optional(Type.String()),
-    targetUrl: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("focus"),
-    controlUrl: Type.Optional(Type.String()),
-    targetId: Type.String(),
-  }),
-  Type.Object({
-    action: Type.Literal("close"),
-    controlUrl: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("snapshot"),
-    controlUrl: Type.Optional(Type.String()),
-    format: Type.Optional(
-      Type.Union([Type.Literal("aria"), Type.Literal("ai")]),
-    ),
-    targetId: Type.Optional(Type.String()),
-    limit: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("screenshot"),
-    controlUrl: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-    fullPage: Type.Optional(Type.Boolean()),
-    ref: Type.Optional(Type.String()),
-    element: Type.Optional(Type.String()),
-    type: Type.Optional(
-      Type.Union([Type.Literal("png"), Type.Literal("jpeg")]),
-    ),
-  }),
-  Type.Object({
-    action: Type.Literal("navigate"),
-    controlUrl: Type.Optional(Type.String()),
-    targetUrl: Type.String(),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("console"),
-    controlUrl: Type.Optional(Type.String()),
-    level: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("pdf"),
-    controlUrl: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("upload"),
-    controlUrl: Type.Optional(Type.String()),
-    paths: Type.Array(Type.String()),
-    ref: Type.Optional(Type.String()),
-    inputRef: Type.Optional(Type.String()),
-    element: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("dialog"),
-    controlUrl: Type.Optional(Type.String()),
-    accept: Type.Boolean(),
-    promptText: Type.Optional(Type.String()),
-    targetId: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("act"),
-    controlUrl: Type.Optional(Type.String()),
-    request: BrowserActSchema,
-  }),
-]);
+// IMPORTANT: OpenAI function tool schemas must have a top-level `type: "object"`.
+// A root-level `Type.Union([...])` compiles to `{ anyOf: [...] }` (no `type`),
+// which OpenAI rejects ("Invalid schema ... type: None"). Keep this schema an object.
+const BrowserToolSchema = Type.Object({
+  action: Type.Union([
+    Type.Literal("status"),
+    Type.Literal("start"),
+    Type.Literal("stop"),
+    Type.Literal("tabs"),
+    Type.Literal("open"),
+    Type.Literal("focus"),
+    Type.Literal("close"),
+    Type.Literal("snapshot"),
+    Type.Literal("screenshot"),
+    Type.Literal("navigate"),
+    Type.Literal("console"),
+    Type.Literal("pdf"),
+    Type.Literal("upload"),
+    Type.Literal("dialog"),
+    Type.Literal("act"),
+  ]),
+  profile: Type.Optional(Type.String()),
+  controlUrl: Type.Optional(Type.String()),
+  targetUrl: Type.Optional(Type.String()),
+  targetId: Type.Optional(Type.String()),
+  limit: Type.Optional(Type.Number()),
+  format: Type.Optional(Type.Union([Type.Literal("aria"), Type.Literal("ai")])),
+  fullPage: Type.Optional(Type.Boolean()),
+  ref: Type.Optional(Type.String()),
+  element: Type.Optional(Type.String()),
+  type: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")])),
+  level: Type.Optional(Type.String()),
+  paths: Type.Optional(Type.Array(Type.String())),
+  inputRef: Type.Optional(Type.String()),
+  timeoutMs: Type.Optional(Type.Number()),
+  accept: Type.Optional(Type.Boolean()),
+  promptText: Type.Optional(Type.String()),
+  request: Type.Optional(BrowserActSchema),
+});
 
 function resolveBrowserBaseUrl(controlUrl?: string) {
   const cfg = loadConfig();
@@ -216,38 +162,41 @@ export function createBrowserTool(opts?: {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const controlUrl = readStringParam(params, "controlUrl");
+      const profile = readStringParam(params, "profile");
       const baseUrl = resolveBrowserBaseUrl(
         controlUrl ?? opts?.defaultControlUrl,
       );
 
       switch (action) {
         case "status":
-          return jsonResult(await browserStatus(baseUrl));
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "start":
-          await browserStart(baseUrl);
-          return jsonResult(await browserStatus(baseUrl));
+          await browserStart(baseUrl, { profile });
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "stop":
-          await browserStop(baseUrl);
-          return jsonResult(await browserStatus(baseUrl));
+          await browserStop(baseUrl, { profile });
+          return jsonResult(await browserStatus(baseUrl, { profile }));
         case "tabs":
-          return jsonResult({ tabs: await browserTabs(baseUrl) });
+          return jsonResult({ tabs: await browserTabs(baseUrl, { profile }) });
         case "open": {
           const targetUrl = readStringParam(params, "targetUrl", {
             required: true,
           });
-          return jsonResult(await browserOpenTab(baseUrl, targetUrl));
+          return jsonResult(
+            await browserOpenTab(baseUrl, targetUrl, { profile }),
+          );
         }
         case "focus": {
           const targetId = readStringParam(params, "targetId", {
             required: true,
           });
-          await browserFocusTab(baseUrl, targetId);
+          await browserFocusTab(baseUrl, targetId, { profile });
           return jsonResult({ ok: true });
         }
         case "close": {
           const targetId = readStringParam(params, "targetId");
-          if (targetId) await browserCloseTab(baseUrl, targetId);
-          else await browserAct(baseUrl, { kind: "close" });
+          if (targetId) await browserCloseTab(baseUrl, targetId, { profile });
+          else await browserAct(baseUrl, { kind: "close" }, { profile });
           return jsonResult({ ok: true });
         }
         case "snapshot": {
@@ -267,6 +216,7 @@ export function createBrowserTool(opts?: {
             format,
             targetId,
             limit,
+            profile,
           });
           if (snapshot.format === "ai") {
             return {
@@ -288,6 +238,7 @@ export function createBrowserTool(opts?: {
             ref,
             element,
             type,
+            profile,
           });
           return await imageResultFromFile({
             label: "browser:screenshot",
@@ -301,7 +252,11 @@ export function createBrowserTool(opts?: {
           });
           const targetId = readStringParam(params, "targetId");
           return jsonResult(
-            await browserNavigate(baseUrl, { url: targetUrl, targetId }),
+            await browserNavigate(baseUrl, {
+              url: targetUrl,
+              targetId,
+              profile,
+            }),
           );
         }
         case "console": {
@@ -312,7 +267,7 @@ export function createBrowserTool(opts?: {
               ? params.targetId.trim()
               : undefined;
           return jsonResult(
-            await browserConsoleMessages(baseUrl, { level, targetId }),
+            await browserConsoleMessages(baseUrl, { level, targetId, profile }),
           );
         }
         case "pdf": {
@@ -320,7 +275,7 @@ export function createBrowserTool(opts?: {
             typeof params.targetId === "string"
               ? params.targetId.trim()
               : undefined;
-          const result = await browserPdfSave(baseUrl, { targetId });
+          const result = await browserPdfSave(baseUrl, { targetId, profile });
           return {
             content: [{ type: "text", text: `FILE:${result.path}` }],
             details: result,
@@ -351,6 +306,7 @@ export function createBrowserTool(opts?: {
               element,
               targetId,
               timeoutMs,
+              profile,
             }),
           );
         }
@@ -375,6 +331,7 @@ export function createBrowserTool(opts?: {
               promptText,
               targetId,
               timeoutMs,
+              profile,
             }),
           );
         }
@@ -386,6 +343,7 @@ export function createBrowserTool(opts?: {
           const result = await browserAct(
             baseUrl,
             request as Parameters<typeof browserAct>[1],
+            { profile },
           );
           return jsonResult(result);
         }

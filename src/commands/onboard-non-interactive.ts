@@ -1,5 +1,9 @@
 import path from "node:path";
-
+import {
+  CLAUDE_CLI_PROFILE_ID,
+  CODEX_CLI_PROFILE_ID,
+  ensureAuthProfileStore,
+} from "../agents/auth-profiles.js";
 import {
   type ClawdbotConfig,
   CONFIG_PATH_CLAWDBOT,
@@ -13,19 +17,25 @@ import { resolveGatewayService } from "../daemon/service.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath, sleep } from "../utils.js";
+import {
+  DEFAULT_GATEWAY_DAEMON_RUNTIME,
+  isGatewayDaemonRuntime,
+} from "./daemon-runtime.js";
 import { healthCommand } from "./health.js";
-import { applyMinimaxConfig, setAnthropicApiKey } from "./onboard-auth.js";
+import {
+  applyAuthProfileConfig,
+  applyMinimaxConfig,
+  setAnthropicApiKey,
+} from "./onboard-auth.js";
 import {
   applyWizardMetadata,
   DEFAULT_WORKSPACE,
   ensureWorkspaceAndSessions,
   randomToken,
 } from "./onboard-helpers.js";
-import type {
-  AuthChoice,
-  OnboardMode,
-  OnboardOptions,
-} from "./onboard-types.js";
+import type { AuthChoice, OnboardOptions } from "./onboard-types.js";
+import { applyOpenAICodexModelDefault } from "./openai-codex-model-default.js";
+import { ensureSystemdUserLingerNonInteractive } from "./systemd-linger.js";
 
 export async function runNonInteractiveOnboarding(
   opts: OnboardOptions,
@@ -33,7 +43,12 @@ export async function runNonInteractiveOnboarding(
 ) {
   const snapshot = await readConfigFileSnapshot();
   const baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
-  const mode: OnboardMode = opts.mode ?? "local";
+  const mode = opts.mode ?? "local";
+  if (mode !== "local" && mode !== "remote") {
+    runtime.error(`Invalid --mode "${String(mode)}" (use local|remote).`);
+    runtime.exit(1);
+    return;
+  }
 
   if (mode === "remote") {
     const remoteUrl = opts.remoteUrl?.trim();
@@ -97,11 +112,51 @@ export async function runNonInteractiveOnboarding(
       return;
     }
     await setAnthropicApiKey(key);
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "anthropic:default",
+      provider: "anthropic",
+      mode: "api_key",
+    });
+  } else if (authChoice === "claude-cli") {
+    const store = ensureAuthProfileStore();
+    if (!store.profiles[CLAUDE_CLI_PROFILE_ID]) {
+      runtime.error(
+        "No Claude CLI credentials found at ~/.claude/.credentials.json",
+      );
+      runtime.exit(1);
+      return;
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: CLAUDE_CLI_PROFILE_ID,
+      provider: "anthropic",
+      mode: "oauth",
+    });
+  } else if (authChoice === "codex-cli") {
+    const store = ensureAuthProfileStore();
+    if (!store.profiles[CODEX_CLI_PROFILE_ID]) {
+      runtime.error("No Codex CLI credentials found at ~/.codex/auth.json");
+      runtime.exit(1);
+      return;
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: CODEX_CLI_PROFILE_ID,
+      provider: "openai-codex",
+      mode: "oauth",
+    });
+    nextConfig = applyOpenAICodexModelDefault(nextConfig).next;
   } else if (authChoice === "minimax") {
     nextConfig = applyMinimaxConfig(nextConfig);
-  } else if (authChoice === "oauth" || authChoice === "antigravity") {
+  } else if (
+    authChoice === "oauth" ||
+    authChoice === "openai-codex" ||
+    authChoice === "antigravity"
+  ) {
     runtime.error(
-      `${authChoice === "oauth" ? "OAuth" : "Antigravity"} requires interactive mode.`,
+      `${
+        authChoice === "oauth" || authChoice === "openai-codex"
+          ? "OAuth"
+          : "Antigravity"
+      } requires interactive mode.`,
     );
     runtime.exit(1);
     return;
@@ -201,15 +256,28 @@ export async function runNonInteractiveOnboarding(
   nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
   await writeConfigFile(nextConfig);
   runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
-  await ensureWorkspaceAndSessions(workspaceDir, runtime);
+  await ensureWorkspaceAndSessions(workspaceDir, runtime, {
+    skipBootstrap: Boolean(nextConfig.agent?.skipBootstrap),
+  });
+
+  const daemonRuntimeRaw = opts.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
 
   if (opts.installDaemon) {
+    if (!isGatewayDaemonRuntime(daemonRuntimeRaw)) {
+      runtime.error("Invalid --daemon-runtime (use node or bun)");
+      runtime.exit(1);
+      return;
+    }
     const service = resolveGatewayService();
     const devMode =
       process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
       process.argv[1]?.endsWith(".ts");
     const { programArguments, workingDirectory } =
-      await resolveGatewayProgramArguments({ port, dev: devMode });
+      await resolveGatewayProgramArguments({
+        port,
+        dev: devMode,
+        runtime: daemonRuntimeRaw,
+      });
     const environment: Record<string, string | undefined> = {
       PATH: process.env.PATH,
       CLAWDBOT_GATEWAY_TOKEN: gatewayToken,
@@ -223,6 +291,7 @@ export async function runNonInteractiveOnboarding(
       workingDirectory,
       environment,
     });
+    await ensureSystemdUserLingerNonInteractive({ runtime });
   }
 
   if (!opts.skipHealth) {
@@ -239,6 +308,7 @@ export async function runNonInteractiveOnboarding(
           authChoice,
           gateway: { port, bind, authMode, tailscaleMode },
           installDaemon: Boolean(opts.installDaemon),
+          daemonRuntime: opts.installDaemon ? daemonRuntimeRaw : undefined,
           skipSkills: Boolean(opts.skipSkills),
           skipHealth: Boolean(opts.skipHealth),
         },

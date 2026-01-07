@@ -23,7 +23,13 @@ import { defaultRuntime } from "../runtime.js";
 export function registerModelsCli(program: Command) {
   const models = program
     .command("models")
-    .description("Model discovery, scanning, and configuration");
+    .description("Model discovery, scanning, and configuration")
+    .option("--json", "Output JSON (alias for `models status --json`)", false)
+    .option(
+      "--plain",
+      "Plain output (alias for `models status --plain`)",
+      false,
+    );
 
   models
     .command("list")
@@ -249,7 +255,11 @@ export function registerModelsCli(program: Command) {
     .option("--yes", "Accept defaults without prompting", false)
     .option("--no-input", "Disable prompts (use defaults)")
     .option("--set-default", "Set agent.model to the first selection", false)
-    .option("--set-image", "Set agent.imageModel to the first image selection", false)
+    .option(
+      "--set-image",
+      "Set agent.imageModel to the first image selection",
+      false,
+    )
     .option("--json", "Output JSON", false)
     .action(async (opts) => {
       try {
@@ -260,9 +270,9 @@ export function registerModelsCli(program: Command) {
       }
     });
 
-  models.action(async () => {
+  models.action(async (opts) => {
     try {
-      await modelsStatusCommand({}, defaultRuntime);
+      await modelsStatusCommand(opts ?? {}, defaultRuntime);
     } catch (err) {
       defaultRuntime.error(String(err));
       defaultRuntime.exit(1);

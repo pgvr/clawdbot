@@ -8,12 +8,11 @@ import { drainSystemEvents } from "../../infra/system-events.js";
 
 export async function prependSystemEvents(params: {
   cfg: ClawdbotConfig;
+  sessionKey: string;
   isMainSession: boolean;
   isNewSession: boolean;
   prefixedBodyBase: string;
 }): Promise<string> {
-  if (!params.isMainSession) return params.prefixedBodyBase;
-
   const compactSystemEvent = (line: string): string | null => {
     const trimmed = line.trim();
     if (!trimmed) return null;
@@ -27,11 +26,11 @@ export async function prependSystemEvents(params: {
   };
 
   const systemLines: string[] = [];
-  const queued = drainSystemEvents();
+  const queued = drainSystemEvents(params.sessionKey);
   systemLines.push(
     ...queued.map(compactSystemEvent).filter((v): v is string => Boolean(v)),
   );
-  if (params.isNewSession) {
+  if (params.isMainSession && params.isNewSession) {
     const summary = await buildProviderSummary(params.cfg);
     if (summary.length > 0) systemLines.unshift(...summary);
   }
@@ -50,6 +49,8 @@ export async function ensureSkillSnapshot(params: {
   isFirstTurnInSession: boolean;
   workspaceDir: string;
   cfg: ClawdbotConfig;
+  /** If provided, only load skills with these names (for per-channel skill filtering) */
+  skillFilter?: string[];
 }): Promise<{
   sessionEntry?: SessionEntry;
   skillsSnapshot?: SessionEntry["skillsSnapshot"];
@@ -64,6 +65,7 @@ export async function ensureSkillSnapshot(params: {
     isFirstTurnInSession,
     workspaceDir,
     cfg,
+    skillFilter,
   } = params;
 
   let nextEntry = sessionEntry;
@@ -77,7 +79,10 @@ export async function ensureSkillSnapshot(params: {
       };
     const skillSnapshot =
       isFirstTurnInSession || !current.skillsSnapshot
-        ? buildWorkspaceSkillSnapshot(workspaceDir, { config: cfg })
+        ? buildWorkspaceSkillSnapshot(workspaceDir, {
+            config: cfg,
+            skillFilter,
+          })
         : current.skillsSnapshot;
     nextEntry = {
       ...current,
@@ -97,7 +102,10 @@ export async function ensureSkillSnapshot(params: {
     nextEntry?.skillsSnapshot ??
     (isFirstTurnInSession
       ? undefined
-      : buildWorkspaceSkillSnapshot(workspaceDir, { config: cfg }));
+      : buildWorkspaceSkillSnapshot(workspaceDir, {
+          config: cfg,
+          skillFilter,
+        }));
   if (
     skillsSnapshot &&
     sessionStore &&
@@ -122,4 +130,33 @@ export async function ensureSkillSnapshot(params: {
   }
 
   return { sessionEntry: nextEntry, skillsSnapshot, systemSent };
+}
+
+export async function incrementCompactionCount(params: {
+  sessionEntry?: SessionEntry;
+  sessionStore?: Record<string, SessionEntry>;
+  sessionKey?: string;
+  storePath?: string;
+  now?: number;
+}): Promise<number | undefined> {
+  const {
+    sessionEntry,
+    sessionStore,
+    sessionKey,
+    storePath,
+    now = Date.now(),
+  } = params;
+  if (!sessionStore || !sessionKey) return undefined;
+  const entry = sessionStore[sessionKey] ?? sessionEntry;
+  if (!entry) return undefined;
+  const nextCount = (entry.compactionCount ?? 0) + 1;
+  sessionStore[sessionKey] = {
+    ...entry,
+    compactionCount: nextCount,
+    updatedAt: now,
+  };
+  if (storePath) {
+    await saveSessionStore(storePath, sessionStore);
+  }
+  return nextCount;
 }

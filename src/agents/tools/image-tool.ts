@@ -1,37 +1,66 @@
-import { type Api, type AssistantMessage, complete, type Context, type Model } from "@mariozechner/pi-ai";
-import { discoverAuthStorage, discoverModels } from "@mariozechner/pi-coding-agent";
+import {
+  type Api,
+  type AssistantMessage,
+  type Context,
+  complete,
+  type Model,
+} from "@mariozechner/pi-ai";
+import {
+  discoverAuthStorage,
+  discoverModels,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 import type { ClawdbotConfig } from "../../config/config.js";
+import { resolveUserPath } from "../../utils.js";
 import { loadWebMedia } from "../../web/media.js";
-import { resolveClawdbotAgentDir } from "../agent-paths.js";
 import { getApiKeyForModel } from "../model-auth.js";
 import { runWithImageModelFallback } from "../model-fallback.js";
 import { ensureClawdbotModelsJson } from "../models-config.js";
 import { extractAssistantText } from "../pi-embedded-utils.js";
-import { resolveUserPath } from "../../utils.js";
 import type { AnyAgentTool } from "./common.js";
 
 const DEFAULT_PROMPT = "Describe the image.";
 
 function ensureImageToolConfigured(cfg?: ClawdbotConfig): boolean {
-  const primary = cfg?.agent?.imageModel?.trim();
-  const fallbacks = cfg?.agent?.imageModelFallbacks ?? [];
-  return Boolean(primary || fallbacks.length > 0);
+  const imageModel = cfg?.agent?.imageModel as
+    | { primary?: string; fallbacks?: string[] }
+    | string
+    | undefined;
+  const primary =
+    typeof imageModel === "string" ? imageModel.trim() : imageModel?.primary;
+  const fallbacks =
+    typeof imageModel === "object" ? (imageModel?.fallbacks ?? []) : [];
+  return Boolean(primary?.trim() || fallbacks.length > 0);
 }
 
-function pickMaxBytes(cfg?: ClawdbotConfig, maxBytesMb?: number): number | undefined {
-  if (typeof maxBytesMb === "number" && Number.isFinite(maxBytesMb) && maxBytesMb > 0) {
+function pickMaxBytes(
+  cfg?: ClawdbotConfig,
+  maxBytesMb?: number,
+): number | undefined {
+  if (
+    typeof maxBytesMb === "number" &&
+    Number.isFinite(maxBytesMb) &&
+    maxBytesMb > 0
+  ) {
     return Math.floor(maxBytesMb * 1024 * 1024);
   }
   const configured = cfg?.agent?.mediaMaxMb;
-  if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+  if (
+    typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+  ) {
     return Math.floor(configured * 1024 * 1024);
   }
   return undefined;
 }
 
-function buildImageContext(prompt: string, base64: string, mimeType: string): Context {
+function buildImageContext(
+  prompt: string,
+  base64: string,
+  mimeType: string,
+): Context {
   return {
     messages: [
       {
@@ -48,15 +77,15 @@ function buildImageContext(prompt: string, base64: string, mimeType: string): Co
 
 async function runImagePrompt(params: {
   cfg?: ClawdbotConfig;
+  agentDir: string;
   modelOverride?: string;
   prompt: string;
   base64: string;
   mimeType: string;
 }): Promise<{ text: string; provider: string; model: string }> {
-  const agentDir = resolveClawdbotAgentDir();
-  await ensureClawdbotModelsJson(params.cfg);
-  const authStorage = discoverAuthStorage(agentDir);
-  const modelRegistry = discoverModels(authStorage, agentDir);
+  await ensureClawdbotModelsJson(params.cfg, params.agentDir);
+  const authStorage = discoverAuthStorage(params.agentDir);
+  const modelRegistry = discoverModels(authStorage, params.agentDir);
 
   const result = await runWithImageModelFallback({
     cfg: params.cfg,
@@ -67,17 +96,23 @@ async function runImagePrompt(params: {
         throw new Error(`Unknown model: ${provider}/${modelId}`);
       }
       if (!model.input?.includes("image")) {
-        throw new Error(`Model does not support images: ${provider}/${modelId}`);
+        throw new Error(
+          `Model does not support images: ${provider}/${modelId}`,
+        );
       }
-      const apiKey = await getApiKeyForModel(model, authStorage);
-      authStorage.setRuntimeApiKey(model.provider, apiKey);
+      const apiKeyInfo = await getApiKeyForModel({
+        model,
+        cfg: params.cfg,
+        agentDir: params.agentDir,
+      });
+      authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
       const context = buildImageContext(
         params.prompt,
         params.base64,
         params.mimeType,
       );
       const message = (await complete(model, context, {
-        apiKey,
+        apiKey: apiKeyInfo.apiKey,
         maxTokens: 512,
         temperature: 0,
       })) as AssistantMessage;
@@ -95,8 +130,13 @@ async function runImagePrompt(params: {
 
 export function createImageTool(options?: {
   config?: ClawdbotConfig;
+  agentDir?: string;
 }): AnyAgentTool | null {
   if (!ensureImageToolConfigured(options?.config)) return null;
+  const agentDir = options?.agentDir;
+  if (!agentDir?.trim()) {
+    throw new Error("createImageTool requires agentDir when enabled");
+  }
   return {
     label: "Image",
     name: "image",
@@ -140,6 +180,7 @@ export function createImageTool(options?: {
       const base64 = media.buffer.toString("base64");
       const result = await runImagePrompt({
         cfg: options?.config,
+        agentDir,
         modelOverride,
         prompt: promptRaw,
         base64,

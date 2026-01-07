@@ -226,6 +226,7 @@ export type GatewaySessionRow = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  reasoningLevel?: string;
   elevatedLevel?: string;
   inputTokens?: number;
   outputTokens?: number;
@@ -251,6 +252,7 @@ export type SessionsPatchResult = {
     updatedAt?: number;
     thinkingLevel?: string;
     verboseLevel?: string;
+    reasoningLevel?: string;
     elevatedLevel?: string;
   };
 };
@@ -271,7 +273,14 @@ export type CronPayload =
       thinking?: string;
       timeoutSeconds?: number;
       deliver?: boolean;
-      channel?: "last" | "whatsapp" | "telegram";
+      provider?:
+        | "last"
+        | "whatsapp"
+        | "telegram"
+        | "discord"
+        | "slack"
+        | "signal"
+        | "imessage";
       to?: string;
       bestEffortDeliver?: boolean;
     };
@@ -306,7 +315,7 @@ export type CronJob = {
 
 export type CronStatus = {
   enabled: boolean;
-  jobCount: number;
+  jobs: number;
   nextWakeAtMs?: number | null;
 };
 

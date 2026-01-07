@@ -7,8 +7,9 @@ import {
   readTool,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-
+import type { ClawdbotConfig } from "../config/config.js";
 import { detectMime } from "../media/mime.js";
+import { isSubagentSessionKey } from "../routing/session-key.js";
 import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
 import {
   type BashToolDefaults,
@@ -17,7 +18,6 @@ import {
   type ProcessToolDefaults,
 } from "./bash-tools.js";
 import { createClawdbotTools } from "./clawdbot-tools.js";
-import type { ClawdbotConfig } from "../config/config.js";
 import type { SandboxContext, SandboxToolPolicy } from "./sandbox.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import { sanitizeToolResultImages } from "./tool-images.js";
@@ -218,6 +218,13 @@ function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
       : undefined;
   if (!schema) return tool;
 
+  // Provider quirks:
+  // - Gemini rejects several JSON Schema keywords, so we scrub those.
+  // - OpenAI rejects function tool schemas unless the *top-level* is `type: "object"`.
+  //   (TypeBox root unions compile to `{ anyOf: [...] }` without `type`).
+  //
+  // Normalize once here so callers can always pass `tools` through unchanged.
+
   // If schema already has type + properties (no top-level anyOf to merge),
   // still clean it for Gemini compatibility
   if (
@@ -231,12 +238,32 @@ function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
     };
   }
 
-  if (!Array.isArray(schema.anyOf)) return tool;
+  // Some tool schemas (esp. unions) may omit `type` at the top-level. If we see
+  // object-ish fields, force `type: "object"` so OpenAI accepts the schema.
+  if (
+    !("type" in schema) &&
+    (typeof schema.properties === "object" || Array.isArray(schema.required)) &&
+    !Array.isArray(schema.anyOf) &&
+    !Array.isArray(schema.oneOf)
+  ) {
+    return {
+      ...tool,
+      parameters: cleanSchemaForGemini({ ...schema, type: "object" }),
+    };
+  }
+
+  const variantKey = Array.isArray(schema.anyOf)
+    ? "anyOf"
+    : Array.isArray(schema.oneOf)
+      ? "oneOf"
+      : null;
+  if (!variantKey) return tool;
+  const variants = schema[variantKey] as unknown[];
   const mergedProperties: Record<string, unknown> = {};
   const requiredCounts = new Map<string, number>();
   let objectVariants = 0;
 
-  for (const entry of schema.anyOf) {
+  for (const entry of variants) {
     if (!entry || typeof entry !== "object") continue;
     const props = (entry as { properties?: unknown }).properties;
     if (!props || typeof props !== "object") continue;
@@ -277,9 +304,18 @@ function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
   const nextSchema: Record<string, unknown> = { ...schema };
   return {
     ...tool,
+    // Flatten union schemas into a single object schema:
+    // - Gemini doesn't allow top-level `type` together with `anyOf`.
+    // - OpenAI rejects schemas without top-level `type: "object"`.
+    // Merging properties preserves useful enums like `action` while keeping schemas portable.
     parameters: cleanSchemaForGemini({
-      ...nextSchema,
-      type: nextSchema.type ?? "object",
+      type: "object",
+      ...(typeof nextSchema.title === "string"
+        ? { title: nextSchema.title }
+        : {}),
+      ...(typeof nextSchema.description === "string"
+        ? { description: nextSchema.description }
+        : {}),
       properties:
         Object.keys(mergedProperties).length > 0
           ? mergedProperties
@@ -296,6 +332,23 @@ function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
 function normalizeToolNames(list?: string[]) {
   if (!list) return [];
   return list.map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+}
+
+const DEFAULT_SUBAGENT_TOOL_DENY = [
+  "sessions_list",
+  "sessions_history",
+  "sessions_send",
+  "sessions_spawn",
+];
+
+function resolveSubagentToolPolicy(cfg?: ClawdbotConfig): SandboxToolPolicy {
+  const configured = cfg?.agent?.subagents?.tools;
+  const deny = [
+    ...DEFAULT_SUBAGENT_TOOL_DENY,
+    ...(Array.isArray(configured?.deny) ? configured.deny : []),
+  ];
+  const allow = Array.isArray(configured?.allow) ? configured.allow : undefined;
+  return { allow, deny };
 }
 
 function filterToolsByPolicy(
@@ -431,33 +484,49 @@ function createClawdbotReadTool(base: AnyAgentTool): AnyAgentTool {
   };
 }
 
-function normalizeSurface(surface?: string): string | undefined {
-  const trimmed = surface?.trim().toLowerCase();
+function normalizeMessageProvider(
+  messageProvider?: string,
+): string | undefined {
+  const trimmed = messageProvider?.trim().toLowerCase();
   return trimmed ? trimmed : undefined;
 }
 
-function shouldIncludeDiscordTool(surface?: string): boolean {
-  const normalized = normalizeSurface(surface);
+function shouldIncludeDiscordTool(messageProvider?: string): boolean {
+  const normalized = normalizeMessageProvider(messageProvider);
   if (!normalized) return false;
   return normalized === "discord" || normalized.startsWith("discord:");
 }
 
-function shouldIncludeSlackTool(surface?: string): boolean {
-  const normalized = normalizeSurface(surface);
+function shouldIncludeSlackTool(messageProvider?: string): boolean {
+  const normalized = normalizeMessageProvider(messageProvider);
   if (!normalized) return false;
   return normalized === "slack" || normalized.startsWith("slack:");
 }
 
+function shouldIncludeTelegramTool(messageProvider?: string): boolean {
+  const normalized = normalizeMessageProvider(messageProvider);
+  if (!normalized) return false;
+  return normalized === "telegram" || normalized.startsWith("telegram:");
+}
+
+function shouldIncludeWhatsAppTool(messageProvider?: string): boolean {
+  const normalized = normalizeMessageProvider(messageProvider);
+  if (!normalized) return false;
+  return normalized === "whatsapp" || normalized.startsWith("whatsapp:");
+}
+
 export function createClawdbotCodingTools(options?: {
   bash?: BashToolDefaults & ProcessToolDefaults;
-  surface?: string;
+  messageProvider?: string;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
+  agentDir?: string;
   config?: ClawdbotConfig;
 }): AnyAgentTool[] {
   const bashToolName = "bash";
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
   const sandboxRoot = sandbox?.workspaceDir;
+  const allowWorkspaceWrites = sandbox?.workspaceAccess !== "ro";
   const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
     if (tool.name === readTool.name) {
       return sandboxRoot
@@ -487,10 +556,12 @@ export function createClawdbotCodingTools(options?: {
   const tools: AnyAgentTool[] = [
     ...base,
     ...(sandboxRoot
-      ? [
-          createSandboxedEditTool(sandboxRoot),
-          createSandboxedWriteTool(sandboxRoot),
-        ]
+      ? allowWorkspaceWrites
+        ? [
+            createSandboxedEditTool(sandboxRoot),
+            createSandboxedWriteTool(sandboxRoot),
+          ]
+        : []
       : []),
     bashTool as unknown as AnyAgentTool,
     processTool as unknown as AnyAgentTool,
@@ -498,19 +569,40 @@ export function createClawdbotCodingTools(options?: {
     ...createClawdbotTools({
       browserControlUrl: sandbox?.browser?.controlUrl,
       agentSessionKey: options?.sessionKey,
-      agentSurface: options?.surface,
+      agentProvider: options?.messageProvider,
+      agentDir: options?.agentDir,
+      sandboxed: !!sandbox,
       config: options?.config,
     }),
   ];
-  const allowDiscord = shouldIncludeDiscordTool(options?.surface);
-  const allowSlack = shouldIncludeSlackTool(options?.surface);
+  const allowDiscord = shouldIncludeDiscordTool(options?.messageProvider);
+  const allowSlack = shouldIncludeSlackTool(options?.messageProvider);
+  const allowTelegram = shouldIncludeTelegramTool(options?.messageProvider);
+  const allowWhatsApp = shouldIncludeWhatsAppTool(options?.messageProvider);
   const filtered = tools.filter((tool) => {
     if (tool.name === "discord") return allowDiscord;
     if (tool.name === "slack") return allowSlack;
+    if (tool.name === "telegram") return allowTelegram;
+    if (tool.name === "whatsapp") return allowWhatsApp;
     return true;
   });
+  const globallyFiltered =
+    options?.config?.agent?.tools &&
+    (options.config.agent.tools.allow?.length ||
+      options.config.agent.tools.deny?.length)
+      ? filterToolsByPolicy(filtered, options.config.agent.tools)
+      : filtered;
   const sandboxed = sandbox
-    ? filterToolsByPolicy(filtered, sandbox.tools)
-    : filtered;
-  return sandboxed.map(normalizeToolParameters);
+    ? filterToolsByPolicy(globallyFiltered, sandbox.tools)
+    : globallyFiltered;
+  const subagentFiltered =
+    isSubagentSessionKey(options?.sessionKey) && options?.sessionKey
+      ? filterToolsByPolicy(
+          sandboxed,
+          resolveSubagentToolPolicy(options.config),
+        )
+      : sandboxed;
+  // Always normalize tool JSON Schemas before handing them to pi-agent/pi-ai.
+  // Without this, some providers (notably OpenAI) will reject root-level union schemas.
+  return subagentFiltered.map(normalizeToolParameters);
 }

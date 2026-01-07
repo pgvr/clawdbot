@@ -1,6 +1,5 @@
 import os from "node:os";
 import path from "node:path";
-import { resolveUserPath } from "../utils.js";
 import type { ClawdbotConfig } from "./types.js";
 
 /**
@@ -27,9 +26,19 @@ export function resolveStateDir(
   env: NodeJS.ProcessEnv = process.env,
   homedir: () => string = os.homedir,
 ): string {
-  const override = env.CLAWDBOT_STATE_DIR?.trim();
-  if (override) return override;
+  const override =
+    env.CLAWDBOT_STATE_DIR?.trim() || env.CLAWDIS_STATE_DIR?.trim();
+  if (override) return resolveUserPath(override);
   return path.join(homedir(), ".clawdbot");
+}
+
+function resolveUserPath(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith("~")) {
+    return path.resolve(trimmed.replace("~", os.homedir()));
+  }
+  return path.resolve(trimmed);
 }
 
 export const STATE_DIR_CLAWDBOT = resolveStateDir();

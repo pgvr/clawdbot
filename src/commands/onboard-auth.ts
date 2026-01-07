@@ -1,47 +1,90 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-
 import type { OAuthCredentials, OAuthProvider } from "@mariozechner/pi-ai";
-import { discoverAuthStorage } from "@mariozechner/pi-coding-agent";
-
-import { resolveClawdbotAgentDir } from "../agents/agent-paths.js";
+import { resolveDefaultAgentDir } from "../agents/agent-scope.js";
+import { upsertAuthProfile } from "../agents/auth-profiles.js";
 import type { ClawdbotConfig } from "../config/config.js";
-import { resolveOAuthPath } from "../config/paths.js";
 
 export async function writeOAuthCredentials(
   provider: OAuthProvider,
   creds: OAuthCredentials,
+  agentDir?: string,
 ): Promise<void> {
-  const filePath = resolveOAuthPath();
-  const dir = path.dirname(filePath);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  let storage: Record<string, OAuthCredentials> = {};
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw) as Record<string, OAuthCredentials>;
-    if (parsed && typeof parsed === "object") storage = parsed;
-  } catch {
-    // ignore
-  }
-  storage[provider] = creds;
-  await fs.writeFile(filePath, `${JSON.stringify(storage, null, 2)}\n`, "utf8");
-  await fs.chmod(filePath, 0o600);
+  // Write to the multi-agent path so gateway finds credentials on startup
+  upsertAuthProfile({
+    profileId: `${provider}:${creds.email ?? "default"}`,
+    credential: {
+      type: "oauth",
+      provider,
+      ...creds,
+    },
+    agentDir: agentDir ?? resolveDefaultAgentDir(),
+  });
 }
 
-export async function setAnthropicApiKey(key: string) {
-  const agentDir = resolveClawdbotAgentDir();
-  const authStorage = discoverAuthStorage(agentDir);
-  authStorage.set("anthropic", { type: "api_key", key });
+export async function setAnthropicApiKey(key: string, agentDir?: string) {
+  // Write to the multi-agent path so gateway finds credentials on startup
+  upsertAuthProfile({
+    profileId: "anthropic:default",
+    credential: {
+      type: "api_key",
+      provider: "anthropic",
+      key,
+    },
+    agentDir: agentDir ?? resolveDefaultAgentDir(),
+  });
 }
 
-export function applyMinimaxConfig(cfg: ClawdbotConfig): ClawdbotConfig {
-  const allowed = new Set(cfg.agent?.allowedModels ?? []);
-  allowed.add("anthropic/claude-opus-4-5");
-  allowed.add("lmstudio/minimax-m2.1-gs32");
+export function applyAuthProfileConfig(
+  cfg: ClawdbotConfig,
+  params: {
+    profileId: string;
+    provider: string;
+    mode: "api_key" | "oauth";
+    email?: string;
+  },
+): ClawdbotConfig {
+  const profiles = {
+    ...cfg.auth?.profiles,
+    [params.profileId]: {
+      provider: params.provider,
+      mode: params.mode,
+      ...(params.email ? { email: params.email } : {}),
+    },
+  };
 
-  const aliases = { ...cfg.agent?.modelAliases };
-  if (!aliases.Opus) aliases.Opus = "anthropic/claude-opus-4-5";
-  if (!aliases.Minimax) aliases.Minimax = "lmstudio/minimax-m2.1-gs32";
+  // Only maintain `auth.order` when the user explicitly configured it.
+  // Default behavior: no explicit order -> resolveAuthProfileOrder can round-robin by lastUsed.
+  const existingProviderOrder = cfg.auth?.order?.[params.provider];
+  const order =
+    existingProviderOrder !== undefined
+      ? {
+          ...cfg.auth?.order,
+          [params.provider]: existingProviderOrder.includes(params.profileId)
+            ? existingProviderOrder
+            : [...existingProviderOrder, params.profileId],
+        }
+      : cfg.auth?.order;
+  return {
+    ...cfg,
+    auth: {
+      ...cfg.auth,
+      profiles,
+      ...(order ? { order } : {}),
+    },
+  };
+}
+
+export function applyMinimaxProviderConfig(
+  cfg: ClawdbotConfig,
+): ClawdbotConfig {
+  const models = { ...cfg.agent?.models };
+  models["anthropic/claude-opus-4-5"] = {
+    ...models["anthropic/claude-opus-4-5"],
+    alias: models["anthropic/claude-opus-4-5"]?.alias ?? "Opus",
+  };
+  models["lmstudio/minimax-m2.1-gs32"] = {
+    ...models["lmstudio/minimax-m2.1-gs32"],
+    alias: models["lmstudio/minimax-m2.1-gs32"]?.alias ?? "Minimax",
+  };
 
   const providers = { ...cfg.models?.providers };
   if (!providers.lmstudio) {
@@ -67,13 +110,31 @@ export function applyMinimaxConfig(cfg: ClawdbotConfig): ClawdbotConfig {
     ...cfg,
     agent: {
       ...cfg.agent,
-      model: "Minimax",
-      allowedModels: Array.from(allowed),
-      modelAliases: aliases,
+      models,
     },
     models: {
       mode: cfg.models?.mode ?? "merge",
       providers,
+    },
+  };
+}
+
+export function applyMinimaxConfig(cfg: ClawdbotConfig): ClawdbotConfig {
+  const next = applyMinimaxProviderConfig(cfg);
+  return {
+    ...next,
+    agent: {
+      ...next.agent,
+      model: {
+        ...(next.agent?.model &&
+        "fallbacks" in (next.agent.model as Record<string, unknown>)
+          ? {
+              fallbacks: (next.agent.model as { fallbacks?: string[] })
+                .fallbacks,
+            }
+          : undefined),
+        primary: "lmstudio/minimax-m2.1-gs32",
+      },
     },
   };
 }

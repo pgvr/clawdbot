@@ -1,15 +1,21 @@
 import path from "node:path";
 
-import { CONFIG_DIR, resolveUserPath } from "../utils.js";
-
-const DEFAULT_AGENT_DIR = path.join(CONFIG_DIR, "agent");
+import { resolveStateDir } from "../config/paths.js";
+import { DEFAULT_AGENT_ID } from "../routing/session-key.js";
+import { resolveUserPath } from "../utils.js";
 
 export function resolveClawdbotAgentDir(): string {
   const override =
     process.env.CLAWDBOT_AGENT_DIR?.trim() ||
-    process.env.PI_CODING_AGENT_DIR?.trim() ||
-    DEFAULT_AGENT_DIR;
-  return resolveUserPath(override);
+    process.env.PI_CODING_AGENT_DIR?.trim();
+  if (override) return resolveUserPath(override);
+  const defaultAgentDir = path.join(
+    resolveStateDir(),
+    "agents",
+    DEFAULT_AGENT_ID,
+    "agent",
+  );
+  return resolveUserPath(defaultAgentDir);
 }
 
 export function ensureClawdbotAgentEnv(): string {

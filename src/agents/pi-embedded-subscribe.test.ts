@@ -129,6 +129,44 @@ describe("subscribeEmbeddedPiSession", () => {
     expect(payload.text).toBe("Hello block");
   });
 
+  it("prepends reasoning before text when enabled", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      reasoningMode: "on",
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Because it helps" },
+        { type: "text", text: "Final answer" },
+      ],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
+    const payload = onBlockReply.mock.calls[0][0];
+    expect(payload.text).toBe(
+      "_Reasoning:_\n_Because it helps_\n\nFinal answer",
+    );
+  });
+
   it("emits block replies on text_end and does not duplicate on message_end", () => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
@@ -182,6 +220,110 @@ describe("subscribeEmbeddedPiSession", () => {
     expect(subscription.assistantTexts).toEqual(["Hello block"]);
   });
 
+  it("does not duplicate when message_end flushes and a late text_end arrives", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "text_end",
+    });
+
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "Hello block",
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Hello block" }],
+    } as AssistantMessage;
+
+    // Simulate a provider that ends the message without emitting text_end.
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
+    expect(subscription.assistantTexts).toEqual(["Hello block"]);
+
+    // Some providers can still emit a late text_end; this must not re-emit.
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_end",
+        content: "Hello block",
+      },
+    });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
+    expect(subscription.assistantTexts).toEqual(["Hello block"]);
+  });
+
+  it("clears block reply state on message_start", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "text_end",
+    });
+
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: { type: "text_delta", delta: "OK" },
+    });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: { type: "text_end" },
+    });
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
+
+    // New assistant message with identical output should still emit.
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: { type: "text_delta", delta: "OK" },
+    });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: { type: "text_end" },
+    });
+    expect(onBlockReply).toHaveBeenCalledTimes(2);
+  });
+
   it("does not emit duplicate block replies when text_end repeats", () => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
@@ -229,6 +371,67 @@ describe("subscribeEmbeddedPiSession", () => {
 
     expect(onBlockReply).toHaveBeenCalledTimes(1);
     expect(subscription.assistantTexts).toEqual(["Hello block"]);
+  });
+
+  it("does not duplicate assistantTexts when message_end repeats", () => {
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Hello world" }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(subscription.assistantTexts).toEqual(["Hello world"]);
+  });
+
+  it("populates assistantTexts for non-streaming models with chunking enabled", () => {
+    // Non-streaming models (e.g. zai/glm-4.7): no text_delta events; message_end
+    // must still populate assistantTexts so providers can deliver a final reply.
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      blockReplyChunking: { minChars: 50, maxChars: 200 }, // Chunking enabled
+    });
+
+    // Simulate non-streaming model: only message_start and message_end, no text_delta
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Response from non-streaming model" }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(subscription.assistantTexts).toEqual([
+      "Response from non-streaming model",
+    ]);
   });
 
   it("does not append when text_end content is a prefix of deltas", () => {
@@ -502,6 +705,306 @@ describe("subscribeEmbeddedPiSession", () => {
     ]);
   });
 
+  it("avoids splitting inside fenced code blocks", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 5,
+        maxChars: 50,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = "Intro\n\n```bash\nline1\nline2\n```\n\nOutro";
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(3);
+    expect(onBlockReply.mock.calls[0][0].text).toBe("Intro");
+    expect(onBlockReply.mock.calls[1][0].text).toBe(
+      "```bash\nline1\nline2\n```",
+    );
+    expect(onBlockReply.mock.calls[2][0].text).toBe("Outro");
+  });
+
+  it("reopens fenced blocks when splitting inside them", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 10,
+        maxChars: 30,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = `\`\`\`txt\n${"a".repeat(80)}\n\`\`\``;
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply.mock.calls.length).toBeGreaterThan(1);
+    for (const call of onBlockReply.mock.calls) {
+      const chunk = call[0].text as string;
+      expect(chunk.startsWith("```txt")).toBe(true);
+      const fenceCount = chunk.match(/```/g)?.length ?? 0;
+      expect(fenceCount).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it("avoids splitting inside tilde fences", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 5,
+        maxChars: 40,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = "Intro\n\n~~~sh\nline1\nline2\n~~~\n\nOutro";
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(3);
+    expect(onBlockReply.mock.calls[1][0].text).toBe("~~~sh\nline1\nline2\n~~~");
+  });
+
+  it("keeps indented fenced blocks intact", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 5,
+        maxChars: 45,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = "Intro\n\n  ```js\n  const x = 1;\n  ```\n\nOutro";
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(3);
+    expect(onBlockReply.mock.calls[1][0].text).toBe(
+      "  ```js\n  const x = 1;\n  ```",
+    );
+  });
+
+  it("accepts longer fence markers for close", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 10,
+        maxChars: 50,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = "Intro\n\n````md\nline1\nline2\n````\n\nOutro";
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(3);
+    expect(onBlockReply.mock.calls[1][0].text).toBe(
+      "````md\nline1\nline2\n````",
+    );
+  });
+
+  it("splits long single-line fenced blocks with reopen/close", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+      blockReplyChunking: {
+        minChars: 10,
+        maxChars: 40,
+        breakPreference: "paragraph",
+      },
+    });
+
+    const text = `\`\`\`json\n${"x".repeat(120)}\n\`\`\``;
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: text,
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply.mock.calls.length).toBeGreaterThan(1);
+    for (const call of onBlockReply.mock.calls) {
+      const chunk = call[0].text as string;
+      expect(chunk.startsWith("```json")).toBe(true);
+      const fenceCount = chunk.match(/```/g)?.length ?? 0;
+      expect(fenceCount).toBeGreaterThanOrEqual(2);
+    }
+  });
+
   it("waits for auto-compaction retry and clears buffered text", async () => {
     const listeners: SessionEventHandler[] = [];
     const session = {
@@ -537,6 +1040,7 @@ describe("subscribeEmbeddedPiSession", () => {
       });
     }
 
+    expect(subscription.isCompacting()).toBe(true);
     expect(subscription.assistantTexts.length).toBe(0);
 
     let resolved = false;
@@ -573,6 +1077,8 @@ describe("subscribeEmbeddedPiSession", () => {
       listener({ type: "auto_compaction_start" });
     }
 
+    expect(subscription.isCompacting()).toBe(true);
+
     let resolved = false;
     const waitPromise = subscription.waitForCompactionRetry().then(() => {
       resolved = true;
@@ -587,6 +1093,7 @@ describe("subscribeEmbeddedPiSession", () => {
 
     await waitPromise;
     expect(resolved).toBe(true);
+    expect(subscription.isCompacting()).toBe(false);
   });
 
   it("waits for multiple compaction retries before resolving", async () => {

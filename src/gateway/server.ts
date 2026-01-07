@@ -28,7 +28,15 @@ import {
   STATE_DIR_CLAWDBOT,
   writeConfigFile,
 } from "../config/config.js";
-import { loadSessionStore, resolveStorePath } from "../config/sessions.js";
+import {
+  deriveDefaultBridgePort,
+  deriveDefaultCanvasHostPort,
+} from "../config/port-defaults.js";
+import {
+  loadSessionStore,
+  resolveMainSessionKey,
+  resolveStorePath,
+} from "../config/sessions.js";
 import { runCronIsolatedAgentTurn } from "../cron/isolated-agent.js";
 import { appendCronRunLog, resolveCronRunLogPath } from "../cron/run-log.js";
 import { CronService } from "../cron/service.js";
@@ -50,6 +58,7 @@ import { startHeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
 import { ensureClawdbotCliOnPath } from "../infra/path-env.js";
+import { autoMigrateLegacyState } from "../infra/state-migrations.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import {
   listSystemPresence,
@@ -196,6 +205,7 @@ const METHODS = [
   "health",
   "providers.status",
   "status",
+  "usage.status",
   "config.get",
   "config.set",
   "config.schema",
@@ -355,6 +365,9 @@ export async function startGatewayServer(
   port = 18789,
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
+  // Ensure all default port derivations (browser/bridge/canvas) see the actual runtime port.
+  process.env.CLAWDBOT_GATEWAY_PORT = String(port);
+
   const configSnapshot = await readConfigFileSnapshot();
   if (configSnapshot.legacyIssues.length > 0) {
     if (isNixMode) {
@@ -381,6 +394,7 @@ export async function startGatewayServer(
   }
 
   const cfgAtStart = loadConfig();
+  await autoMigrateLegacyState({ cfg: cfgAtStart, log });
   const bindMode = opts.bind ?? cfgAtStart.gateway?.bind ?? "loopback";
   const bindHost = opts.host ?? resolveGatewayBindHost(bindMode);
   if (!bindHost) {
@@ -475,7 +489,7 @@ export async function startGatewayServer(
     wakeMode: "now" | "next-heartbeat";
     sessionKey: string;
     deliver: boolean;
-    channel:
+    provider:
       | "last"
       | "whatsapp"
       | "telegram"
@@ -507,7 +521,7 @@ export async function startGatewayServer(
         thinking: value.thinking,
         timeoutSeconds: value.timeoutSeconds,
         deliver: value.deliver,
-        channel: value.channel,
+        provider: value.provider,
         to: value.to,
       },
       state: { nextRunAtMs: now },
@@ -664,6 +678,10 @@ export async function startGatewayServer(
   >();
   setCommandLaneConcurrency("cron", cfgAtStart.cron?.maxConcurrentRuns ?? 1);
   setCommandLaneConcurrency("main", cfgAtStart.agent?.maxConcurrent ?? 1);
+  setCommandLaneConcurrency(
+    "subagent",
+    cfgAtStart.agent?.subagents?.maxConcurrent ?? 1,
+  );
 
   const cronLogger = getChildLogger({
     module: "cron",
@@ -676,7 +694,9 @@ export async function startGatewayServer(
     const cron = new CronService({
       storePath,
       cronEnabled,
-      enqueueSystemEvent,
+      enqueueSystemEvent: (text) => {
+        enqueueSystemEvent(text, { sessionKey: resolveMainSessionKey(cfg) });
+      },
       requestHeartbeatNow,
       runIsolatedAgentJob: async ({ job, message }) => {
         const runtimeConfig = loadConfig();
@@ -819,9 +839,11 @@ export async function startGatewayServer(
     }
     if (process.env.CLAWDBOT_BRIDGE_PORT !== undefined) {
       const parsed = Number.parseInt(process.env.CLAWDBOT_BRIDGE_PORT, 10);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : 18790;
+      return Number.isFinite(parsed) && parsed > 0
+        ? parsed
+        : deriveDefaultBridgePort(port);
     }
-    return 18790;
+    return deriveDefaultBridgePort(port);
   })();
 
   const bridgeHost = (() => {
@@ -848,9 +870,14 @@ export async function startGatewayServer(
   })();
 
   const canvasHostPort = (() => {
+    if (process.env.CLAWDBOT_CANVAS_HOST_PORT !== undefined) {
+      const parsed = Number.parseInt(process.env.CLAWDBOT_CANVAS_HOST_PORT, 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      return deriveDefaultCanvasHostPort(port);
+    }
     const configured = cfgAtStart.canvasHost?.port;
     if (typeof configured === "number" && configured > 0) return configured;
-    return 18793;
+    return deriveDefaultCanvasHostPort(port);
   })();
 
   if (canvasHostEnabled && bridgeEnabled && bridgeHost) {
@@ -1743,6 +1770,10 @@ export async function startGatewayServer(
 
     setCommandLaneConcurrency("cron", nextConfig.cron?.maxConcurrentRuns ?? 1);
     setCommandLaneConcurrency("main", nextConfig.agent?.maxConcurrent ?? 1);
+    setCommandLaneConcurrency(
+      "subagent",
+      nextConfig.agent?.subagents?.maxConcurrent ?? 1,
+    );
 
     if (plan.hotReasons.length > 0) {
       logReload.info(

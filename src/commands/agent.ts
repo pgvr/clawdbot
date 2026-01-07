@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
 import { lookupContextTokens } from "../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
@@ -15,11 +16,12 @@ import {
 } from "../agents/model-selection.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
+import { resolveAgentTimeoutMs } from "../agents/timeout.js";
+import { hasNonzeroUsage } from "../agents/usage.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
   ensureAgentWorkspace,
 } from "../agents/workspace.js";
-import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import {
   normalizeThinkLevel,
@@ -42,9 +44,17 @@ import {
   emitAgentEvent,
   registerAgentRunContext,
 } from "../infra/agent-events.js";
+import { deliverOutboundPayloads } from "../infra/outbound/deliver.js";
+import { buildOutboundResultEnvelope } from "../infra/outbound/envelope.js";
+import {
+  formatOutboundPayloadLog,
+  type NormalizedOutboundPayload,
+  normalizeOutboundPayloads,
+  normalizeOutboundPayloadsForJson,
+} from "../infra/outbound/payloads.js";
+import { resolveOutboundTarget } from "../infra/outbound/targets.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { resolveSendPolicy } from "../sessions/send-policy.js";
-import { resolveTelegramToken } from "../telegram/token.js";
 import { normalizeE164 } from "../utils.js";
 
 type AgentCommandOpts = {
@@ -57,7 +67,8 @@ type AgentCommandOpts = {
   json?: boolean;
   timeout?: string;
   deliver?: boolean;
-  surface?: string;
+  /** Message provider context (webchat|voicewake|whatsapp|...). */
+  messageProvider?: string;
   provider?: string; // delivery provider (whatsapp|telegram|...)
   bestEffortDeliver?: boolean;
   abortSignal?: AbortSignal;
@@ -160,7 +171,7 @@ export async function agentCommand(
   const workspaceDirRaw = cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
-    ensureBootstrapFiles: true,
+    ensureBootstrapFiles: !cfg.agent?.skipBootstrap,
   });
   const workspaceDir = workspace.dir;
 
@@ -189,11 +200,17 @@ export async function agentCommand(
   const timeoutSecondsRaw =
     opts.timeout !== undefined
       ? Number.parseInt(String(opts.timeout), 10)
-      : (agentCfg?.timeoutSeconds ?? 600);
-  if (Number.isNaN(timeoutSecondsRaw) || timeoutSecondsRaw <= 0) {
+      : undefined;
+  if (
+    timeoutSecondsRaw !== undefined &&
+    (Number.isNaN(timeoutSecondsRaw) || timeoutSecondsRaw <= 0)
+  ) {
     throw new Error("--timeout must be a positive integer (seconds)");
   }
-  const timeoutMs = Math.max(timeoutSecondsRaw, 1) * 1000;
+  const timeoutMs = resolveAgentTimeoutMs({
+    cfg,
+    overrideSeconds: timeoutSecondsRaw,
+  });
 
   const sessionResolution = resolveSession({
     cfg,
@@ -223,7 +240,7 @@ export async function agentCommand(
       cfg,
       entry: sessionEntry,
       sessionKey,
-      surface: sessionEntry?.surface,
+      provider: sessionEntry?.provider,
       chatType: sessionEntry?.chatType,
     });
     if (sendPolicy === "deny") {
@@ -245,8 +262,6 @@ export async function agentCommand(
   const skillsSnapshot = needsSkillsSnapshot
     ? buildWorkspaceSkillSnapshot(workspaceDir, { config: cfg })
     : sessionEntry?.skillsSnapshot;
-
-  const { token: telegramToken } = resolveTelegramToken(cfg);
 
   if (skillsSnapshot && sessionStore && sessionKey && needsSkillsSnapshot) {
     const current = sessionEntry ?? {
@@ -289,7 +304,8 @@ export async function agentCommand(
     });
   let provider = defaultProvider;
   let model = defaultModel;
-  const hasAllowlist = (agentCfg?.allowedModels?.length ?? 0) > 0;
+  const hasAllowlist =
+    agentCfg?.models && Object.keys(agentCfg.models).length > 0;
   const hasStoredOverride = Boolean(
     sessionEntry?.modelOverride || sessionEntry?.providerOverride,
   );
@@ -335,6 +351,18 @@ export async function agentCommand(
       model = storedModelOverride;
     }
   }
+  if (sessionEntry?.authProfileOverride) {
+    const store = ensureAuthProfileStore();
+    const profile = store.profiles[sessionEntry.authProfileOverride];
+    if (!profile || profile.provider !== provider) {
+      delete sessionEntry.authProfileOverride;
+      sessionEntry.updatedAt = Date.now();
+      if (sessionStore && sessionKey) {
+        sessionStore[sessionKey] = sessionEntry;
+        await saveSessionStore(storePath, sessionStore);
+      }
+    }
+  }
 
   if (!resolvedThinkLevel) {
     let catalogForThinking = modelCatalog ?? allowedModelCatalog;
@@ -352,24 +380,14 @@ export async function agentCommand(
   const sessionFile = resolveSessionTranscriptPath(sessionId);
 
   const startedAt = Date.now();
-  emitAgentEvent({
-    runId,
-    stream: "job",
-    data: {
-      state: "started",
-      startedAt,
-      to: opts.to ?? null,
-      sessionId,
-      isNewSession,
-    },
-  });
+  let lifecycleEnded = false;
 
   let result: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
   let fallbackProvider = provider;
   let fallbackModel = model;
   try {
-    const surface =
-      opts.surface?.trim().toLowerCase() ||
+    const messageProvider =
+      opts.messageProvider?.trim().toLowerCase() ||
       (() => {
         const raw = opts.provider?.trim().toLowerCase();
         if (!raw) return undefined;
@@ -383,7 +401,7 @@ export async function agentCommand(
         runEmbeddedPiAgent({
           sessionId,
           sessionKey,
-          surface,
+          messageProvider,
           sessionFile,
           workspaceDir,
           config: cfg,
@@ -391,6 +409,7 @@ export async function agentCommand(
           prompt: body,
           provider: providerOverride,
           model: modelOverride,
+          authProfileId: sessionEntry?.authProfileOverride,
           thinkLevel: resolvedThinkLevel,
           verboseLevel: resolvedVerboseLevel,
           timeoutMs,
@@ -399,6 +418,13 @@ export async function agentCommand(
           abortSignal: opts.abortSignal,
           extraSystemPrompt: opts.extraSystemPrompt,
           onAgentEvent: (evt) => {
+            if (
+              evt.stream === "lifecycle" &&
+              typeof evt.data?.phase === "string" &&
+              (evt.data.phase === "end" || evt.data.phase === "error")
+            ) {
+              lifecycleEnded = true;
+            }
             emitAgentEvent({
               runId,
               stream: evt.stream,
@@ -410,33 +436,31 @@ export async function agentCommand(
     result = fallbackResult.result;
     fallbackProvider = fallbackResult.provider;
     fallbackModel = fallbackResult.model;
-    emitAgentEvent({
-      runId,
-      stream: "job",
-      data: {
-        state: "done",
-        startedAt,
-        endedAt: Date.now(),
-        to: opts.to ?? null,
-        sessionId,
-        durationMs: Date.now() - startedAt,
-        aborted: result.meta.aborted ?? false,
-      },
-    });
+    if (!lifecycleEnded) {
+      emitAgentEvent({
+        runId,
+        stream: "lifecycle",
+        data: {
+          phase: "end",
+          startedAt,
+          endedAt: Date.now(),
+          aborted: result.meta.aborted ?? false,
+        },
+      });
+    }
   } catch (err) {
-    emitAgentEvent({
-      runId,
-      stream: "job",
-      data: {
-        state: "error",
-        startedAt,
-        endedAt: Date.now(),
-        to: opts.to ?? null,
-        sessionId,
-        durationMs: Date.now() - startedAt,
-        error: String(err),
-      },
-    });
+    if (!lifecycleEnded) {
+      emitAgentEvent({
+        runId,
+        stream: "lifecycle",
+        data: {
+          phase: "error",
+          startedAt,
+          endedAt: Date.now(),
+          error: String(err),
+        },
+      });
+    }
     throw err;
   }
 
@@ -464,7 +488,7 @@ export async function agentCommand(
       contextTokens,
     };
     next.abortedLastRun = result.meta.aborted ?? false;
-    if (usage) {
+    if (hasNonzeroUsage(usage)) {
       const input = usage.input ?? 0;
       const output = usage.output ?? 0;
       const promptTokens =
@@ -485,296 +509,104 @@ export async function agentCommand(
   const deliveryProvider =
     deliveryProviderRaw === "imsg" ? "imessage" : deliveryProviderRaw;
 
-  const whatsappTarget = opts.to ? normalizeE164(opts.to) : allowFrom[0];
-  const telegramTarget = opts.to?.trim() || undefined;
-  const discordTarget = opts.to?.trim() || undefined;
-  const slackTarget = opts.to?.trim() || undefined;
-  const signalTarget = opts.to?.trim() || undefined;
-  const imessageTarget = opts.to?.trim() || undefined;
-
   const logDeliveryError = (err: unknown) => {
-    const deliveryTarget =
-      deliveryProvider === "telegram"
-        ? telegramTarget
-        : deliveryProvider === "whatsapp"
-          ? whatsappTarget
-          : deliveryProvider === "discord"
-            ? discordTarget
-            : deliveryProvider === "slack"
-              ? slackTarget
-              : deliveryProvider === "signal"
-                ? signalTarget
-                : deliveryProvider === "imessage"
-                  ? imessageTarget
-                  : undefined;
     const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
     runtime.error?.(message);
     if (!runtime.error) runtime.log(message);
   };
 
-  if (deliver) {
-    if (deliveryProvider === "whatsapp" && !whatsappTarget) {
-      const err = new Error(
-        "Delivering to WhatsApp requires --to <E.164> or whatsapp.allowFrom[0]",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "telegram" && !telegramTarget) {
-      const err = new Error("Delivering to Telegram requires --to <chatId>");
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "discord" && !discordTarget) {
-      const err = new Error(
-        "Delivering to Discord requires --to <channelId|user:ID|channel:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "slack" && !slackTarget) {
-      const err = new Error(
-        "Delivering to Slack requires --to <channelId|user:ID|channel:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "signal" && !signalTarget) {
-      const err = new Error(
-        "Delivering to Signal requires --to <E.164|group:ID|signal:group:ID|signal:+E.164>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "imessage" && !imessageTarget) {
-      const err = new Error(
-        "Delivering to iMessage requires --to <handle|chat_id:ID>",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (deliveryProvider === "webchat") {
-      const err = new Error(
-        "Delivering to WebChat is not supported via `clawdbot agent`; use WhatsApp/Telegram or run with --deliver=false.",
-      );
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-    if (
-      deliveryProvider !== "whatsapp" &&
-      deliveryProvider !== "telegram" &&
-      deliveryProvider !== "discord" &&
-      deliveryProvider !== "slack" &&
-      deliveryProvider !== "signal" &&
-      deliveryProvider !== "imessage" &&
-      deliveryProvider !== "webchat"
-    ) {
-      const err = new Error(`Unknown provider: ${deliveryProvider}`);
-      if (!bestEffortDeliver) throw err;
-      logDeliveryError(err);
-    }
-  }
-
-  if (opts.json) {
-    const normalizedPayloads = payloads.map((p) => ({
-      text: p.text ?? "",
-      mediaUrl: p.mediaUrl ?? null,
-      mediaUrls: p.mediaUrls ?? (p.mediaUrl ? [p.mediaUrl] : undefined),
-    }));
-    runtime.log(
-      JSON.stringify(
-        { payloads: normalizedPayloads, meta: result.meta },
-        null,
-        2,
-      ),
-    );
-    if (!deliver) return;
-  }
-
-  if (payloads.length === 0) {
-    runtime.log("No reply from agent.");
-    return;
-  }
-
-  const deliveryTextLimit =
+  const isDeliveryProviderKnown =
     deliveryProvider === "whatsapp" ||
     deliveryProvider === "telegram" ||
     deliveryProvider === "discord" ||
     deliveryProvider === "slack" ||
     deliveryProvider === "signal" ||
-    deliveryProvider === "imessage"
-      ? resolveTextChunkLimit(cfg, deliveryProvider)
-      : resolveTextChunkLimit(cfg, "whatsapp");
+    deliveryProvider === "imessage" ||
+    deliveryProvider === "webchat";
 
-  for (const payload of payloads) {
-    const mediaList =
-      payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+  const resolvedTarget =
+    deliver && isDeliveryProviderKnown
+      ? resolveOutboundTarget({
+          provider: deliveryProvider,
+          to: opts.to,
+          allowFrom,
+        })
+      : null;
+  const deliveryTarget = resolvedTarget?.ok ? resolvedTarget.to : undefined;
 
-    if (!opts.json) {
-      const lines: string[] = [];
-      if (payload.text) lines.push(payload.text.trimEnd());
-      for (const url of mediaList) lines.push(`MEDIA:${url}`);
-      runtime.log(lines.join("\n"));
-    }
-
-    if (!deliver) continue;
-
-    const text = payload.text ?? "";
-    const media = mediaList;
-    if (!text && media.length === 0) continue;
-
-    if (deliveryProvider === "whatsapp" && whatsappTarget) {
-      try {
-        const primaryMedia = media[0];
-        await deps.sendMessageWhatsApp(whatsappTarget, text, {
-          verbose: false,
-          mediaUrl: primaryMedia,
-        });
-        for (const extra of media.slice(1)) {
-          await deps.sendMessageWhatsApp(whatsappTarget, "", {
-            verbose: false,
-            mediaUrl: extra,
-          });
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-      continue;
-    }
-
-    if (deliveryProvider === "telegram" && telegramTarget) {
-      try {
-        if (media.length === 0) {
-          for (const chunk of chunkText(text, deliveryTextLimit)) {
-            await deps.sendMessageTelegram(telegramTarget, chunk, {
-              verbose: false,
-              token: telegramToken || undefined,
-            });
-          }
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageTelegram(telegramTarget, caption, {
-              verbose: false,
-              mediaUrl: url,
-              token: telegramToken || undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "discord" && discordTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageDiscord(discordTarget, text, {
-            token: process.env.DISCORD_BOT_TOKEN,
-          });
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageDiscord(discordTarget, caption, {
-              token: process.env.DISCORD_BOT_TOKEN,
-              mediaUrl: url,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "slack" && slackTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageSlack(slackTarget, text);
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageSlack(slackTarget, caption, {
-              mediaUrl: url,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "signal" && signalTarget) {
-      try {
-        if (media.length === 0) {
-          await deps.sendMessageSignal(signalTarget, text, {
-            maxBytes: cfg.signal?.mediaMaxMb
-              ? cfg.signal.mediaMaxMb * 1024 * 1024
-              : cfg.agent?.mediaMaxMb
-                ? cfg.agent.mediaMaxMb * 1024 * 1024
-                : undefined,
-          });
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageSignal(signalTarget, caption, {
-              mediaUrl: url,
-              maxBytes: cfg.signal?.mediaMaxMb
-                ? cfg.signal.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
-    }
-
-    if (deliveryProvider === "imessage" && imessageTarget) {
-      try {
-        if (media.length === 0) {
-          for (const chunk of chunkText(text, deliveryTextLimit)) {
-            await deps.sendMessageIMessage(imessageTarget, chunk, {
-              maxBytes: cfg.imessage?.mediaMaxMb
-                ? cfg.imessage.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        } else {
-          let first = true;
-          for (const url of media) {
-            const caption = first ? text : "";
-            first = false;
-            await deps.sendMessageIMessage(imessageTarget, caption, {
-              mediaUrl: url,
-              maxBytes: cfg.imessage?.mediaMaxMb
-                ? cfg.imessage.mediaMaxMb * 1024 * 1024
-                : cfg.agent?.mediaMaxMb
-                  ? cfg.agent.mediaMaxMb * 1024 * 1024
-                  : undefined,
-            });
-          }
-        }
-      } catch (err) {
-        if (!bestEffortDeliver) throw err;
-        logDeliveryError(err);
-      }
+  if (deliver) {
+    if (!isDeliveryProviderKnown) {
+      const err = new Error(`Unknown provider: ${deliveryProvider}`);
+      if (!bestEffortDeliver) throw err;
+      logDeliveryError(err);
+    } else if (resolvedTarget && !resolvedTarget.ok) {
+      if (!bestEffortDeliver) throw resolvedTarget.error;
+      logDeliveryError(resolvedTarget.error);
     }
   }
+
+  const normalizedPayloads = normalizeOutboundPayloadsForJson(payloads);
+  if (opts.json) {
+    runtime.log(
+      JSON.stringify(
+        buildOutboundResultEnvelope({
+          payloads: normalizedPayloads,
+          meta: result.meta,
+        }),
+        null,
+        2,
+      ),
+    );
+    if (!deliver) {
+      return { payloads: normalizedPayloads, meta: result.meta };
+    }
+  }
+
+  if (payloads.length === 0) {
+    runtime.log("No reply from agent.");
+    return { payloads: [], meta: result.meta };
+  }
+
+  const deliveryPayloads = normalizeOutboundPayloads(payloads);
+  const logPayload = (payload: NormalizedOutboundPayload) => {
+    if (opts.json) return;
+    const output = formatOutboundPayloadLog(payload);
+    if (output) runtime.log(output);
+  };
+  if (!deliver) {
+    for (const payload of deliveryPayloads) {
+      logPayload(payload);
+    }
+  }
+  if (
+    deliver &&
+    (deliveryProvider === "whatsapp" ||
+      deliveryProvider === "telegram" ||
+      deliveryProvider === "discord" ||
+      deliveryProvider === "slack" ||
+      deliveryProvider === "signal" ||
+      deliveryProvider === "imessage")
+  ) {
+    if (deliveryTarget) {
+      await deliverOutboundPayloads({
+        cfg,
+        provider: deliveryProvider,
+        to: deliveryTarget,
+        payloads: deliveryPayloads,
+        bestEffort: bestEffortDeliver,
+        onError: (err) => logDeliveryError(err),
+        onPayload: logPayload,
+        deps: {
+          sendWhatsApp: deps.sendMessageWhatsApp,
+          sendTelegram: deps.sendMessageTelegram,
+          sendDiscord: deps.sendMessageDiscord,
+          sendSlack: deps.sendMessageSlack,
+          sendSignal: deps.sendMessageSignal,
+          sendIMessage: deps.sendMessageIMessage,
+        },
+      });
+    }
+  }
+
+  return { payloads: normalizedPayloads, meta: result.meta };
 }

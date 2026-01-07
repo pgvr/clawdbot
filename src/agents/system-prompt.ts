@@ -6,6 +6,11 @@ export function buildAgentSystemPromptAppend(params: {
   extraSystemPrompt?: string;
   ownerNumbers?: string[];
   reasoningTagHint?: boolean;
+  toolNames?: string[];
+  modelAliasLines?: string[];
+  userTimezone?: string;
+  userTime?: string;
+  heartbeatPrompt?: string;
   runtimeInfo?: {
     host?: string;
     os?: string;
@@ -16,10 +21,78 @@ export function buildAgentSystemPromptAppend(params: {
   sandboxInfo?: {
     enabled: boolean;
     workspaceDir?: string;
+    workspaceAccess?: "none" | "ro" | "rw";
+    agentWorkspaceMount?: string;
     browserControlUrl?: string;
     browserNoVncUrl?: string;
   };
 }) {
+  const toolSummaries: Record<string, string> = {
+    read: "Read file contents",
+    write: "Create or overwrite files",
+    edit: "Make precise edits to files",
+    grep: "Search file contents for patterns",
+    find: "Find files by glob pattern",
+    ls: "List directory contents",
+    bash: "Run shell commands",
+    process: "Manage background bash sessions",
+    whatsapp_login: "Generate and wait for WhatsApp QR login",
+    browser: "Control the dedicated clawd browser",
+    canvas: "Present/eval/snapshot the Canvas",
+    nodes: "List/describe/notify/camera/screen on paired nodes",
+    cron: "Manage cron jobs and wake events",
+    gateway: "Restart the running Gateway process",
+    sessions_list: "List sessions with filters and last messages",
+    sessions_history: "Fetch message history for a session",
+    sessions_send: "Send a message into another session",
+    image: "Analyze an image with the configured image model",
+    discord: "Send Discord reactions/messages and manage threads",
+    slack: "Send Slack messages and manage channels",
+    telegram: "Send Telegram reactions",
+    whatsapp: "Send WhatsApp reactions",
+  };
+
+  const toolOrder = [
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "find",
+    "ls",
+    "bash",
+    "process",
+    "whatsapp_login",
+    "browser",
+    "canvas",
+    "nodes",
+    "cron",
+    "gateway",
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "image",
+    "discord",
+    "slack",
+    "telegram",
+    "whatsapp",
+  ];
+
+  const normalizedTools = (params.toolNames ?? [])
+    .map((tool) => tool.trim().toLowerCase())
+    .filter(Boolean);
+  const availableTools = new Set(normalizedTools);
+  const extraTools = Array.from(
+    new Set(normalizedTools.filter((tool) => !toolOrder.includes(tool))),
+  );
+  const enabledTools = toolOrder.filter((tool) => availableTools.has(tool));
+  const toolLines = enabledTools.map((tool) => {
+    const summary = toolSummaries[tool];
+    return summary ? `- ${tool}: ${summary}` : `- ${tool}`;
+  });
+  for (const tool of extraTools.sort()) {
+    toolLines.push(`- ${tool}`);
+  }
+
   const thinkHint =
     params.defaultThinkLevel && params.defaultThinkLevel !== "off"
       ? `Default thinking level: ${params.defaultThinkLevel}.`
@@ -45,6 +118,12 @@ export function buildAgentSystemPromptAppend(params: {
         "<final>Hey there! What would you like to do next?</final>",
       ].join(" ")
     : undefined;
+  const userTimezone = params.userTimezone?.trim();
+  const userTime = params.userTime?.trim();
+  const heartbeatPrompt = params.heartbeatPrompt?.trim();
+  const heartbeatPromptLine = heartbeatPrompt
+    ? `Heartbeat prompt: ${heartbeatPrompt}`
+    : "Heartbeat prompt: (configured)";
   const runtimeInfo = params.runtimeInfo;
   const runtimeLines: string[] = [];
   if (runtimeInfo?.host) runtimeLines.push(`Host: ${runtimeInfo.host}`);
@@ -61,19 +140,37 @@ export function buildAgentSystemPromptAppend(params: {
     "You are Clawd, a personal assistant running inside Clawdbot.",
     "",
     "## Tooling",
-    "Pi lists the standard tools above. This runtime enables:",
-    "- grep: search file contents for patterns",
-    "- find: find files by glob pattern",
-    "- ls: list directory contents",
-    "- bash: run shell commands (supports background via yieldMs/background)",
-    "- process: manage background bash sessions",
-    "- whatsapp_login: generate a WhatsApp QR code and wait for linking",
-    "- browser: control clawd's dedicated browser",
-    "- canvas: present/eval/snapshot the Canvas",
-    "- nodes: list/describe/notify/camera/screen on paired nodes",
-    "- cron: manage cron jobs and wake events",
+    "Tool availability (filtered by policy):",
+    toolLines.length > 0
+      ? toolLines.join("\n")
+      : [
+          "Pi lists the standard tools above. This runtime enables:",
+          "- grep: search file contents for patterns",
+          "- find: find files by glob pattern",
+          "- ls: list directory contents",
+          "- bash: run shell commands (supports background via yieldMs/background)",
+          "- process: manage background bash sessions",
+          "- whatsapp_login: generate a WhatsApp QR code and wait for linking",
+          "- browser: control clawd's dedicated browser",
+          "- canvas: present/eval/snapshot the Canvas",
+          "- nodes: list/describe/notify/camera/screen on paired nodes",
+          "- cron: manage cron jobs and wake events",
+          "- sessions_list: list sessions",
+          "- sessions_history: fetch session history",
+          "- sessions_send: send to another session",
+        ].join("\n"),
     "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.",
     "",
+    params.modelAliasLines && params.modelAliasLines.length > 0
+      ? "## Model Aliases"
+      : "",
+    params.modelAliasLines && params.modelAliasLines.length > 0
+      ? "Prefer aliases when specifying model overrides; full provider/model is also accepted."
+      : "",
+    params.modelAliasLines && params.modelAliasLines.length > 0
+      ? params.modelAliasLines.join("\n")
+      : "",
+    params.modelAliasLines && params.modelAliasLines.length > 0 ? "" : "",
     "## Workspace",
     `Your working directory is: ${params.workspaceDir}`,
     "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
@@ -85,6 +182,13 @@ export function buildAgentSystemPromptAppend(params: {
           "Some tools may be unavailable due to sandbox policy.",
           params.sandboxInfo.workspaceDir
             ? `Sandbox workspace: ${params.sandboxInfo.workspaceDir}`
+            : "",
+          params.sandboxInfo.workspaceAccess
+            ? `Agent workspace access: ${params.sandboxInfo.workspaceAccess}${
+                params.sandboxInfo.agentWorkspaceMount
+                  ? ` (mounted at ${params.sandboxInfo.agentWorkspaceMount})`
+                  : ""
+              }`
             : "",
           params.sandboxInfo.browserControlUrl
             ? `Sandbox browser control URL: ${params.sandboxInfo.browserControlUrl}`
@@ -107,6 +211,10 @@ export function buildAgentSystemPromptAppend(params: {
     "Never send streaming/partial replies to external messaging surfaces; only final replies should be delivered there.",
     "Clawdbot handles message transport automatically; respond normally and your reply will be delivered to the current chat.",
     "",
+    userTimezone || userTime ? "## Time" : "",
+    userTimezone ? `User timezone: ${userTimezone}` : "",
+    userTime ? `Current user time: ${userTime}` : "",
+    userTimezone || userTime ? "" : "",
     "## Reply Tags",
     "To request a native reply/quote on supported surfaces, include one tag in your reply:",
     "- [[reply_to_current]] replies to the triggering message.",
@@ -124,7 +232,8 @@ export function buildAgentSystemPromptAppend(params: {
 
   lines.push(
     "## Heartbeats",
-    'If you receive a heartbeat poll (a user message containing just "HEARTBEAT"), and there is nothing that needs attention, reply exactly:',
+    heartbeatPromptLine,
+    "If you receive a heartbeat poll (a user message matching the heartbeat prompt above), and there is nothing that needs attention, reply exactly:",
     "HEARTBEAT_OK",
     'Clawdbot treats a leading/trailing "HEARTBEAT_OK" as a heartbeat ack (and may discard it).',
     'If something needs attention, do NOT include "HEARTBEAT_OK"; reply with the alert text instead.',

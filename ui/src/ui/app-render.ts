@@ -184,9 +184,11 @@ export function renderApp(state: AppViewState) {
   const sessionsCount = state.sessionsResult?.count ?? null;
   const cronNext = state.cronStatus?.nextWakeAtMs ?? null;
   const chatDisabledReason = state.connected ? null : "Disconnected from gateway.";
+  const isChat = state.tab === "chat";
+  const chatFocus = isChat && state.settings.chatFocusMode;
 
   return html`
-    <div class="shell">
+    <div class="shell ${isChat ? "shell--chat" : ""} ${chatFocus ? "shell--chat-focus" : ""}">
       <header class="topbar">
         <div class="brand">
           <div class="brand-title">Clawdbot Control</div>
@@ -211,7 +213,7 @@ export function renderApp(state: AppViewState) {
           `,
         )}
       </aside>
-      <main class="content">
+      <main class="content ${isChat ? "content--chat" : ""}">
         <section class="content-header">
           <div>
             <div class="page-title">${titleForTab(state.tab)}</div>
@@ -377,26 +379,36 @@ export function renderApp(state: AppViewState) {
                 state.sessionKey = next;
                 state.chatMessage = "";
                 state.chatStream = null;
+                state.chatStreamStartedAt = null;
                 state.chatRunId = null;
                 state.resetToolStream();
+                state.resetChatScroll();
                 state.applySettings({ ...state.settings, sessionKey: next });
                 void loadChatHistory(state);
               },
               thinkingLevel: state.chatThinkingLevel,
               loading: state.chatLoading,
               sending: state.chatSending,
-              messages: [...state.chatMessages, ...state.chatToolMessages],
+              messages: state.chatMessages,
+              toolMessages: state.chatToolMessages,
               stream: state.chatStream,
+              streamStartedAt: state.chatStreamStartedAt,
               draft: state.chatMessage,
               connected: state.connected,
               canSend: state.connected,
               disabledReason: chatDisabledReason,
               error: state.lastError,
               sessions: state.sessionsResult,
+              focusMode: state.settings.chatFocusMode,
               onRefresh: () => {
                 state.resetToolStream();
                 return loadChatHistory(state);
               },
+              onToggleFocusMode: () =>
+                state.applySettings({
+                  ...state.settings,
+                  chatFocusMode: !state.settings.chatFocusMode,
+                }),
               onDraftChange: (next) => (state.chatMessage = next),
               onSend: () => state.handleSendChat(),
             })

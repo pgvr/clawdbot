@@ -5,9 +5,13 @@ import type { RuntimeEnv } from "../runtime.js";
 import { sendCommand } from "./send.js";
 
 let testConfig: Record<string, unknown> = {};
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => testConfig,
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => testConfig,
+  };
+});
 
 const callGatewayMock = vi.fn();
 vi.mock("../gateway/call.js", () => ({
@@ -77,6 +81,26 @@ describe("sendCommand", () => {
     expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("g1"));
   });
 
+  it("does not override remote gateway URL", async () => {
+    callGatewayMock.mockResolvedValueOnce({ messageId: "g2" });
+    testConfig = {
+      gateway: { mode: "remote", remote: { url: "wss://remote.example" } },
+    };
+    const deps = makeDeps();
+    await sendCommand(
+      {
+        to: "+1",
+        message: "hi",
+      },
+      deps,
+      runtime,
+    );
+    const args = callGatewayMock.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(args?.url).toBeUndefined();
+  });
+
   it("passes gifPlayback to gateway send", async () => {
     callGatewayMock.mockClear();
     callGatewayMock.mockResolvedValueOnce({ messageId: "g1" });
@@ -113,7 +137,7 @@ describe("sendCommand", () => {
     expect(deps.sendMessageTelegram).toHaveBeenCalledWith(
       "123",
       "hi",
-      expect.objectContaining({ token: "token-abc" }),
+      expect.objectContaining({ token: "token-abc", verbose: false }),
     );
     expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
   });
@@ -134,7 +158,7 @@ describe("sendCommand", () => {
     expect(deps.sendMessageTelegram).toHaveBeenCalledWith(
       "123",
       "hi",
-      expect.objectContaining({ token: "cfg-token" }),
+      expect.objectContaining({ token: "cfg-token", verbose: false }),
     );
   });
 
@@ -152,7 +176,7 @@ describe("sendCommand", () => {
     expect(deps.sendMessageDiscord).toHaveBeenCalledWith(
       "channel:chan",
       "hi",
-      expect.objectContaining({ token: "token-discord" }),
+      expect.objectContaining({ verbose: false }),
     );
     expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
   });
@@ -169,7 +193,7 @@ describe("sendCommand", () => {
     expect(deps.sendMessageSignal).toHaveBeenCalledWith(
       "+15551234567",
       "hi",
-      expect.objectContaining({ mediaUrl: undefined }),
+      expect.objectContaining({ maxBytes: undefined }),
     );
     expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
   });
@@ -185,11 +209,7 @@ describe("sendCommand", () => {
       deps,
       runtime,
     );
-    expect(deps.sendMessageSlack).toHaveBeenCalledWith(
-      "channel:C123",
-      "hi",
-      expect.objectContaining({ mediaUrl: undefined }),
-    );
+    expect(deps.sendMessageSlack).toHaveBeenCalledWith("channel:C123", "hi");
     expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
   });
 
@@ -205,7 +225,7 @@ describe("sendCommand", () => {
     expect(deps.sendMessageIMessage).toHaveBeenCalledWith(
       "chat_id:42",
       "hi",
-      expect.objectContaining({ mediaUrl: undefined }),
+      expect.objectContaining({ maxBytes: undefined }),
     );
     expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
   });
@@ -223,7 +243,7 @@ describe("sendCommand", () => {
       runtime,
     );
     expect(runtime.log).toHaveBeenCalledWith(
-      expect.stringContaining('"provider": "web"'),
+      expect.stringContaining('"provider": "whatsapp"'),
     );
   });
 });

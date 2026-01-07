@@ -33,4 +33,42 @@ describe("buildAgentSystemPromptAppend", () => {
     expect(prompt).toContain("<think>...</think>");
     expect(prompt).toContain("<final>...</final>");
   });
+
+  it("lists available tools when provided", () => {
+    const prompt = buildAgentSystemPromptAppend({
+      workspaceDir: "/tmp/clawd",
+      toolNames: ["bash", "sessions_list", "sessions_history", "sessions_send"],
+    });
+
+    expect(prompt).toContain("Tool availability (filtered by policy):");
+    expect(prompt).toContain("sessions_list");
+    expect(prompt).toContain("sessions_history");
+    expect(prompt).toContain("sessions_send");
+  });
+
+  it("includes user time when provided", () => {
+    const prompt = buildAgentSystemPromptAppend({
+      workspaceDir: "/tmp/clawd",
+      userTimezone: "America/Chicago",
+      userTime: "Monday 2026-01-05 15:26",
+    });
+
+    expect(prompt).toContain("## Time");
+    expect(prompt).toContain("User timezone: America/Chicago");
+    expect(prompt).toContain("Current user time: Monday 2026-01-05 15:26");
+  });
+
+  it("includes model alias guidance when aliases are provided", () => {
+    const prompt = buildAgentSystemPromptAppend({
+      workspaceDir: "/tmp/clawd",
+      modelAliasLines: [
+        "- Opus: anthropic/claude-opus-4-5",
+        "- Sonnet: anthropic/claude-sonnet-4-5",
+      ],
+    });
+
+    expect(prompt).toContain("## Model Aliases");
+    expect(prompt).toContain("Prefer aliases when specifying model overrides");
+    expect(prompt).toContain("- Opus: anthropic/claude-opus-4-5");
+  });
 });
