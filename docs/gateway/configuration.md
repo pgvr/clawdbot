@@ -493,6 +493,12 @@ Set `telegram.enabled: false` to disable automatic startup.
     streamMode: "partial",               // off | partial | block (draft streaming)
     actions: { reactions: true },        // tool action gates (false disables)
     mediaMaxMb: 5,
+    retry: {                             // outbound retry policy
+      attempts: 3,
+      minDelayMs: 400,
+      maxDelayMs: 30000,
+      jitter: 0.1
+    },
     proxy: "socks5://localhost:9050",
     webhookUrl: "https://example.com/telegram-webhook",
     webhookSecret: "secret",
@@ -505,6 +511,7 @@ Draft streaming notes:
 - Uses Telegram `sendMessageDraft` (draft bubble, not a real message).
 - Requires **private chat topics** (message_thread_id in DMs; bot has topics enabled).
 - `/reasoning stream` streams reasoning into the draft, then sends the final answer.
+Retry policy defaults and behavior are documented in [Retry policy](/concepts/retry).
 
 ### `discord` (bot transport)
 
@@ -559,7 +566,13 @@ Configure the Discord bot by setting the bot token and optional gating:
         }
       }
     },
-    historyLimit: 20                        // include last N guild messages as context
+    historyLimit: 20,                       // include last N guild messages as context
+    retry: {                                // outbound retry policy
+      attempts: 3,
+      minDelayMs: 500,
+      maxDelayMs: 30000,
+      jitter: 0.1
+    }
   }
 }
 ```
@@ -571,6 +584,7 @@ Reaction notification modes:
 - `own`: reactions on the bot's own messages (default).
 - `all`: all reactions on all messages.
 - `allowlist`: reactions from `guilds.<id>.users` on all messages (empty list disables).
+Retry policy defaults and behavior are documented in [Retry policy](/concepts/retry).
 
 ### `slack` (socket mode)
 
@@ -812,6 +826,88 @@ If you configure the same alias name (case-insensitive) yourself, your value win
   }
 }
 ```
+
+#### `agent.contextPruning` (opt-in tool-result pruning)
+
+`agent.contextPruning` prunes **old tool results** from the in-memory context right before a request is sent to the LLM.
+It does **not** modify the session history on disk (`*.jsonl` remains complete).
+
+This is intended to reduce token usage for chatty agents that accumulate large tool outputs over time.
+
+High level:
+- Never touches user/assistant messages.
+- Protects the last `keepLastAssistants` assistant messages (no tool results after that point are pruned).
+- Protects the bootstrap prefix (nothing before the first user message is pruned).
+- Modes:
+  - `adaptive`: soft-trims oversized tool results (keep head/tail) when the estimated context ratio crosses `softTrimRatio`.
+    Then hard-clears the oldest eligible tool results when the estimated context ratio crosses `hardClearRatio` **and**
+    there’s enough prunable tool-result bulk (`minPrunableToolChars`).
+  - `aggressive`: always replaces eligible tool results before the cutoff with the `hardClear.placeholder` (no ratio checks).
+
+Soft vs hard pruning (what changes in the context sent to the LLM):
+- **Soft-trim**: only for *oversized* tool results. Keeps the beginning + end and inserts `...` in the middle.
+  - Before: `toolResult("…very long output…")`
+  - After: `toolResult("HEAD…\n...\n…TAIL\n\n[Tool result trimmed: …]")`
+- **Hard-clear**: replaces the entire tool result with the placeholder.
+  - Before: `toolResult("…very long output…")`
+  - After: `toolResult("[Old tool result content cleared]")`
+
+Notes / current limitations:
+- Tool results containing **image blocks are skipped** (never trimmed/cleared) right now.
+- The estimated “context ratio” is based on **characters** (approximate), not exact tokens.
+- If the session doesn’t contain at least `keepLastAssistants` assistant messages yet, pruning is skipped.
+- In `aggressive` mode, `hardClear.enabled` is ignored (eligible tool results are always replaced with `hardClear.placeholder`).
+
+Example (minimal):
+```json5
+{
+  agent: {
+    contextPruning: {
+      mode: "adaptive"
+    }
+  }
+}
+```
+
+Defaults (when `mode` is `"adaptive"` or `"aggressive"`):
+- `keepLastAssistants`: `3`
+- `softTrimRatio`: `0.3` (adaptive only)
+- `hardClearRatio`: `0.5` (adaptive only)
+- `minPrunableToolChars`: `50000` (adaptive only)
+- `softTrim`: `{ maxChars: 4000, headChars: 1500, tailChars: 1500 }` (adaptive only)
+- `hardClear`: `{ enabled: true, placeholder: "[Old tool result content cleared]" }`
+
+Example (aggressive, minimal):
+```json5
+{
+  agent: {
+    contextPruning: {
+      mode: "aggressive"
+    }
+  }
+}
+```
+
+Example (adaptive tuned):
+```json5
+{
+  agent: {
+    contextPruning: {
+      mode: "adaptive",
+      keepLastAssistants: 3,
+      softTrimRatio: 0.3,
+      hardClearRatio: 0.5,
+      minPrunableToolChars: 50000,
+      softTrim: { maxChars: 4000, headChars: 1500, tailChars: 1500 },
+      hardClear: { enabled: true, placeholder: "[Old tool result content cleared]" },
+      // Optional: restrict pruning to specific tools (deny wins; supports "*" wildcards)
+      tools: { deny: ["browser", "canvas"] },
+    }
+  }
+}
+```
+
+See [/concepts/session-pruning](/concepts/session-pruning) for behavior details.
 
 Block streaming:
 - `agent.blockStreamingDefault`: `"on"`/`"off"` (default on).
