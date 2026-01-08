@@ -67,6 +67,12 @@ describe("chunkText", () => {
     const chunks = chunkText(text, 10);
     expect(chunks).toEqual(["Supercalif", "ragilistic", "expialidoc", "ious"]);
   });
+
+  it("keeps parenthetical phrases together", () => {
+    const text = "Heads up now (Though now I'm curious)ok";
+    const chunks = chunkText(text, 35);
+    expect(chunks).toEqual(["Heads up now", "(Though now I'm curious)ok"]);
+  });
 });
 
 describe("resolveTextChunkLimit", () => {
@@ -83,6 +89,20 @@ describe("resolveTextChunkLimit", () => {
     const cfg = { telegram: { textChunkLimit: 1234 } };
     expect(resolveTextChunkLimit(cfg, "whatsapp")).toBe(4000);
     expect(resolveTextChunkLimit(cfg, "telegram")).toBe(1234);
+  });
+
+  it("prefers account overrides when provided", () => {
+    const cfg = {
+      telegram: {
+        textChunkLimit: 2000,
+        accounts: {
+          default: { textChunkLimit: 1234 },
+          primary: { textChunkLimit: 777 },
+        },
+      },
+    };
+    expect(resolveTextChunkLimit(cfg, "telegram", "primary")).toBe(777);
+    expect(resolveTextChunkLimit(cfg, "telegram", "default")).toBe(1234);
   });
 
   it("uses the matching provider override", () => {
@@ -169,5 +189,30 @@ describe("chunkMarkdownText", () => {
         .filter((line) => !/^( {0,3})(`{3,}|~{3,})(.*)$/.test(line));
       expect(nonFenceLines.join("\n").trim()).not.toBe("");
     }
+  });
+
+  it("keeps parenthetical phrases together", () => {
+    const text = "Heads up now (Though now I'm curious)ok";
+    const chunks = chunkMarkdownText(text, 35);
+    expect(chunks).toEqual(["Heads up now", "(Though now I'm curious)ok"]);
+  });
+
+  it("handles nested parentheses", () => {
+    const text = "Hello (outer (inner) end) world";
+    const chunks = chunkMarkdownText(text, 26);
+    expect(chunks).toEqual(["Hello (outer (inner) end)", "world"]);
+  });
+
+  it("hard-breaks when a parenthetical exceeds the limit", () => {
+    const text = `(${"a".repeat(80)})`;
+    const chunks = chunkMarkdownText(text, 20);
+    expect(chunks[0]?.length).toBe(20);
+    expect(chunks.join("")).toBe(text);
+  });
+
+  it("ignores unmatched closing parentheses", () => {
+    const text = "Hello) world (ok)";
+    const chunks = chunkMarkdownText(text, 12);
+    expect(chunks).toEqual(["Hello)", "world (ok)"]);
   });
 });

@@ -17,6 +17,8 @@ import type {
   CronRunLogEntry,
   CronStatus,
   HealthSnapshot,
+  LogEntry,
+  LogLevel,
   PresenceEntry,
   ProvidersStatusSnapshot,
   SessionsListResult,
@@ -37,6 +39,7 @@ import { renderConnections } from "./views/connections";
 import { renderCron } from "./views/cron";
 import { renderDebug } from "./views/debug";
 import { renderInstances } from "./views/instances";
+import { renderLogs } from "./views/logs";
 import { renderNodes } from "./views/nodes";
 import { renderOverview } from "./views/overview";
 import { renderSessions } from "./views/sessions";
@@ -57,12 +60,20 @@ import {
   saveSkillApiKey,
   updateSkillEdit,
   updateSkillEnabled,
+  type SkillMessage,
 } from "./controllers/skills";
 import { loadNodes } from "./controllers/nodes";
 import { loadChatHistory } from "./controllers/chat";
-import { loadConfig, saveConfig, updateConfigFormValue } from "./controllers/config";
+import {
+  applyConfig,
+  loadConfig,
+  runUpdate,
+  saveConfig,
+  updateConfigFormValue,
+} from "./controllers/config";
 import { loadCronRuns, toggleCronJob, runCronJob, removeCronJob, addCronJob } from "./controllers/cron";
 import { loadDebug, callDebugMethod } from "./controllers/debug";
+import { loadLogs } from "./controllers/logs";
 
 export type EventLogEntry = {
   ts: number;
@@ -97,6 +108,8 @@ export type AppViewState = {
   configValid: boolean | null;
   configIssues: unknown[];
   configSaving: boolean;
+  configApplying: boolean;
+  updateRunning: boolean;
   configSnapshot: ConfigSnapshot | null;
   configSchema: unknown | null;
   configSchemaLoading: boolean;
@@ -154,6 +167,7 @@ export type AppViewState = {
   skillsError: string | null;
   skillsFilter: string;
   skillEdits: Record<string, string>;
+  skillMessages: Record<string, SkillMessage>;
   skillsBusyKey: string | null;
   debugLoading: boolean;
   debugStatus: StatusSummary | null;
@@ -164,6 +178,14 @@ export type AppViewState = {
   debugCallParams: string;
   debugCallResult: string | null;
   debugCallError: string | null;
+  logsLoading: boolean;
+  logsError: string | null;
+  logsFile: string | null;
+  logsEntries: LogEntry[];
+  logsFilterText: string;
+  logsLevelFilters: Record<LogLevel, boolean>;
+  logsAutoFollow: boolean;
+  logsTruncated: boolean;
   client: GatewayBrowserClient | null;
   connect: () => void;
   setTab: (tab: Tab) => void;
@@ -175,8 +197,10 @@ export type AppViewState = {
   handleWhatsAppWait: () => Promise<void>;
   handleWhatsAppLogout: () => Promise<void>;
   handleTelegramSave: () => Promise<void>;
-  handleSendChat: () => Promise<void>;
+  handleSendChat: (messageOverride?: string, opts?: { restoreDraft?: boolean }) => Promise<void>;
   resetToolStream: () => void;
+  handleLogsScroll: (event: Event) => void;
+  exportLogs: (lines: string[], label: string) => void;
 };
 
 export function renderApp(state: AppViewState) {
@@ -200,6 +224,16 @@ export function renderApp(state: AppViewState) {
             <span>Health</span>
             <span class="mono">${state.connected ? "OK" : "Offline"}</span>
           </div>
+          ${isChat
+            ? renderChatFocusToggle(
+                state.settings.chatFocusMode,
+                () =>
+                  state.applySettings({
+                    ...state.settings,
+                    chatFocusMode: !state.settings.chatFocusMode,
+                  }),
+              )
+            : nothing}
           ${renderThemeToggle(state)}
         </div>
       </header>
@@ -244,8 +278,13 @@ export function renderApp(state: AppViewState) {
                 state.sessionKey = next;
                 state.chatMessage = "";
                 state.resetToolStream();
-                state.applySettings({ ...state.settings, sessionKey: next });
+                state.applySettings({
+                  ...state.settings,
+                  sessionKey: next,
+                  lastActiveSessionKey: next,
+                });
               },
+              onConnect: () => state.connect(),
               onRefresh: () => state.loadOverview(),
             })
           : nothing}
@@ -354,13 +393,15 @@ export function renderApp(state: AppViewState) {
               error: state.skillsError,
               filter: state.skillsFilter,
               edits: state.skillEdits,
+              messages: state.skillMessages,
               busyKey: state.skillsBusyKey,
               onFilterChange: (next) => (state.skillsFilter = next),
-              onRefresh: () => loadSkills(state),
+              onRefresh: () => loadSkills(state, { clearMessages: true }),
               onToggle: (key, enabled) => updateSkillEnabled(state, key, enabled),
               onEdit: (key, value) => updateSkillEdit(state, key, value),
               onSaveKey: (key) => saveSkillApiKey(state, key),
-              onInstall: (name, installId) => installSkill(state, name, installId),
+              onInstall: (skillKey, name, installId) =>
+                installSkill(state, skillKey, name, installId),
             })
           : nothing}
 
@@ -383,7 +424,11 @@ export function renderApp(state: AppViewState) {
                 state.chatRunId = null;
                 state.resetToolStream();
                 state.resetChatScroll();
-                state.applySettings({ ...state.settings, sessionKey: next });
+                state.applySettings({
+                  ...state.settings,
+                  sessionKey: next,
+                  lastActiveSessionKey: next,
+                });
                 void loadChatHistory(state);
               },
               thinkingLevel: state.chatThinkingLevel,
@@ -399,18 +444,17 @@ export function renderApp(state: AppViewState) {
               disabledReason: chatDisabledReason,
               error: state.lastError,
               sessions: state.sessionsResult,
-              focusMode: state.settings.chatFocusMode,
+              isToolOutputExpanded: (id) => state.toolOutputExpanded.has(id),
+              onToolOutputToggle: (id, expanded) =>
+                state.toggleToolOutput(id, expanded),
               onRefresh: () => {
                 state.resetToolStream();
                 return loadChatHistory(state);
               },
-              onToggleFocusMode: () =>
-                state.applySettings({
-                  ...state.settings,
-                  chatFocusMode: !state.settings.chatFocusMode,
-                }),
               onDraftChange: (next) => (state.chatMessage = next),
               onSend: () => state.handleSendChat(),
+              onNewSession: () =>
+                state.handleSendChat("/new", { restoreDraft: true }),
             })
           : nothing}
 
@@ -421,6 +465,8 @@ export function renderApp(state: AppViewState) {
               issues: state.configIssues,
               loading: state.configLoading,
               saving: state.configSaving,
+              applying: state.configApplying,
+              updating: state.updateRunning,
               connected: state.connected,
               schema: state.configSchema,
               schemaLoading: state.configSchemaLoading,
@@ -432,6 +478,8 @@ export function renderApp(state: AppViewState) {
               onFormPatch: (path, value) => updateConfigFormValue(state, path, value),
               onReload: () => loadConfig(state),
               onSave: () => saveConfig(state),
+              onApply: () => applyConfig(state),
+              onUpdate: () => runUpdate(state),
             })
           : nothing}
 
@@ -453,7 +501,36 @@ export function renderApp(state: AppViewState) {
               onCall: () => callDebugMethod(state),
             })
           : nothing}
+
+        ${state.tab === "logs"
+          ? renderLogs({
+              loading: state.logsLoading,
+              error: state.logsError,
+              file: state.logsFile,
+              entries: state.logsEntries,
+              filterText: state.logsFilterText,
+              levelFilters: state.logsLevelFilters,
+              autoFollow: state.logsAutoFollow,
+              truncated: state.logsTruncated,
+              onFilterTextChange: (next) => (state.logsFilterText = next),
+              onLevelToggle: (level, enabled) => {
+                state.logsLevelFilters = { ...state.logsLevelFilters, [level]: enabled };
+              },
+              onToggleAutoFollow: (next) => (state.logsAutoFollow = next),
+              onRefresh: () => loadLogs(state, { reset: true }),
+              onExport: (lines, label) => state.exportLogs(lines, label),
+              onScroll: (event) => state.handleLogsScroll(event),
+            })
+          : nothing}
       </main>
+      <a
+        class="docs-link"
+        href="https://docs.clawd.bot"
+        target="_blank"
+        rel="noreferrer"
+      >
+        Docs
+      </a>
     </div>
   `;
 }
@@ -531,6 +608,19 @@ function renderThemeToggle(state: AppViewState) {
         </button>
       </div>
     </div>
+  `;
+}
+
+function renderChatFocusToggle(focusMode: boolean, onToggle: () => void) {
+  return html`
+    <button
+      class="btn ${focusMode ? "active" : ""}"
+      @click=${onToggle}
+      aria-pressed=${focusMode}
+      title="Toggle focus mode (hide sidebar + page header)"
+    >
+      Focus
+    </button>
   `;
 }
 

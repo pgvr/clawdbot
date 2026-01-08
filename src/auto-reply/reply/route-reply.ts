@@ -30,6 +30,8 @@ export type RouteReplyParams = {
   threadId?: number;
   /** Config for provider-specific settings. */
   cfg: ClawdbotConfig;
+  /** Optional abort signal for cooperative cancellation. */
+  abortSignal?: AbortSignal;
 };
 
 export type RouteReplyResult = {
@@ -52,7 +54,7 @@ export type RouteReplyResult = {
 export async function routeReply(
   params: RouteReplyParams,
 ): Promise<RouteReplyResult> {
-  const { payload, channel, to, accountId, threadId } = params;
+  const { payload, channel, to, accountId, threadId, abortSignal } = params;
 
   // Debug: `pnpm test src/auto-reply/reply/route-reply.test.ts`
   const text = payload.text ?? "";
@@ -72,12 +74,23 @@ export async function routeReply(
     text: string;
     mediaUrl?: string;
   }): Promise<RouteReplyResult> => {
+    if (abortSignal?.aborted) {
+      return { ok: false, error: "Reply routing aborted" };
+    }
     const { text, mediaUrl } = params;
     switch (channel) {
       case "telegram": {
+        const replyToMessageId = replyToId
+          ? Number.parseInt(replyToId, 10)
+          : undefined;
+        const resolvedReplyToMessageId = Number.isFinite(replyToMessageId)
+          ? replyToMessageId
+          : undefined;
         const result = await sendMessageTelegram(to, text, {
           mediaUrl,
           messageThreadId: threadId,
+          replyToMessageId: resolvedReplyToMessageId,
+          accountId,
         });
         return { ok: true, messageId: result.messageId };
       }
@@ -86,6 +99,7 @@ export async function routeReply(
         const result = await sendMessageSlack(to, text, {
           mediaUrl,
           threadTs: replyToId,
+          accountId,
         });
         return { ok: true, messageId: result.messageId };
       }
@@ -94,17 +108,24 @@ export async function routeReply(
         const result = await sendMessageDiscord(to, text, {
           mediaUrl,
           replyTo: replyToId,
+          accountId,
         });
         return { ok: true, messageId: result.messageId };
       }
 
       case "signal": {
-        const result = await sendMessageSignal(to, text, { mediaUrl });
+        const result = await sendMessageSignal(to, text, {
+          mediaUrl,
+          accountId,
+        });
         return { ok: true, messageId: result.messageId };
       }
 
       case "imessage": {
-        const result = await sendMessageIMessage(to, text, { mediaUrl });
+        const result = await sendMessageIMessage(to, text, {
+          mediaUrl,
+          accountId,
+        });
         return { ok: true, messageId: result.messageId };
       }
 
@@ -132,12 +153,18 @@ export async function routeReply(
   };
 
   try {
+    if (abortSignal?.aborted) {
+      return { ok: false, error: "Reply routing aborted" };
+    }
     if (mediaUrls.length === 0) {
       return await sendOne({ text });
     }
 
     let last: RouteReplyResult | undefined;
     for (let i = 0; i < mediaUrls.length; i++) {
+      if (abortSignal?.aborted) {
+        return { ok: false, error: "Reply routing aborted" };
+      }
       const mediaUrl = mediaUrls[i];
       const caption = i === 0 ? text : "";
       last = await sendOne({ text: caption, mediaUrl });

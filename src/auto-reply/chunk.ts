@@ -8,6 +8,7 @@ import {
   isSafeFenceBreak,
   parseFenceSpans,
 } from "../markdown/fences.js";
+import { normalizeAccountId } from "../routing/session-key.js";
 
 export type TextChunkProvider =
   | "whatsapp"
@@ -31,15 +32,44 @@ const DEFAULT_CHUNK_LIMIT_BY_PROVIDER: Record<TextChunkProvider, number> = {
 export function resolveTextChunkLimit(
   cfg: ClawdbotConfig | undefined,
   provider?: TextChunkProvider,
+  accountId?: string | null,
 ): number {
   const providerOverride = (() => {
     if (!provider) return undefined;
-    if (provider === "whatsapp") return cfg?.whatsapp?.textChunkLimit;
-    if (provider === "telegram") return cfg?.telegram?.textChunkLimit;
-    if (provider === "discord") return cfg?.discord?.textChunkLimit;
-    if (provider === "slack") return cfg?.slack?.textChunkLimit;
-    if (provider === "signal") return cfg?.signal?.textChunkLimit;
-    if (provider === "imessage") return cfg?.imessage?.textChunkLimit;
+    const normalizedAccountId = normalizeAccountId(accountId);
+    if (provider === "whatsapp") {
+      return cfg?.whatsapp?.textChunkLimit;
+    }
+    if (provider === "telegram") {
+      return (
+        cfg?.telegram?.accounts?.[normalizedAccountId]?.textChunkLimit ??
+        cfg?.telegram?.textChunkLimit
+      );
+    }
+    if (provider === "discord") {
+      return (
+        cfg?.discord?.accounts?.[normalizedAccountId]?.textChunkLimit ??
+        cfg?.discord?.textChunkLimit
+      );
+    }
+    if (provider === "slack") {
+      return (
+        cfg?.slack?.accounts?.[normalizedAccountId]?.textChunkLimit ??
+        cfg?.slack?.textChunkLimit
+      );
+    }
+    if (provider === "signal") {
+      return (
+        cfg?.signal?.accounts?.[normalizedAccountId]?.textChunkLimit ??
+        cfg?.signal?.textChunkLimit
+      );
+    }
+    if (provider === "imessage") {
+      return (
+        cfg?.imessage?.accounts?.[normalizedAccountId]?.textChunkLimit ??
+        cfg?.imessage?.textChunkLimit
+      );
+    }
     return undefined;
   })();
   if (typeof providerOverride === "number" && providerOverride > 0) {
@@ -60,18 +90,27 @@ export function chunkText(text: string, limit: number): string[] {
   while (remaining.length > limit) {
     const window = remaining.slice(0, limit);
 
-    // 1) Prefer a newline break inside the window.
-    let breakIdx = window.lastIndexOf("\n");
+    // 1) Prefer a newline break inside the window (outside parentheses).
+    let lastNewline = -1;
+    let lastWhitespace = -1;
+    let depth = 0;
+    for (let i = 0; i < window.length; i++) {
+      const char = window[i];
+      if (char === "(") {
+        depth += 1;
+        continue;
+      }
+      if (char === ")" && depth > 0) {
+        depth -= 1;
+        continue;
+      }
+      if (depth !== 0) continue;
+      if (char === "\n") lastNewline = i;
+      else if (/\s/.test(char)) lastWhitespace = i;
+    }
 
     // 2) Otherwise prefer the last whitespace (word boundary) inside the window.
-    if (breakIdx <= 0) {
-      for (let i = window.length - 1; i >= 0; i--) {
-        if (/\s/.test(window[i])) {
-          breakIdx = i;
-          break;
-        }
-      }
-    }
+    let breakIdx = lastNewline > 0 ? lastNewline : lastWhitespace;
 
     // 3) Fallback: hard break exactly at the limit.
     if (breakIdx <= 0) breakIdx = limit;
@@ -204,15 +243,27 @@ function pickSafeBreakIndex(
   window: string,
   spans: ReturnType<typeof parseFenceSpans>,
 ): number {
-  let newlineIdx = window.lastIndexOf("\n");
-  while (newlineIdx > 0) {
-    if (isSafeFenceBreak(spans, newlineIdx)) return newlineIdx;
-    newlineIdx = window.lastIndexOf("\n", newlineIdx - 1);
+  let lastNewline = -1;
+  let lastWhitespace = -1;
+  let depth = 0;
+
+  for (let i = 0; i < window.length; i++) {
+    if (!isSafeFenceBreak(spans, i)) continue;
+    const char = window[i];
+    if (char === "(") {
+      depth += 1;
+      continue;
+    }
+    if (char === ")" && depth > 0) {
+      depth -= 1;
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (char === "\n") lastNewline = i;
+    else if (/\s/.test(char)) lastWhitespace = i;
   }
 
-  for (let i = window.length - 1; i > 0; i--) {
-    if (/\s/.test(window[i]) && isSafeFenceBreak(spans, i)) return i;
-  }
-
+  if (lastNewline > 0) return lastNewline;
+  if (lastWhitespace > 0) return lastWhitespace;
   return -1;
 }
