@@ -169,8 +169,9 @@ Options:
 - `--workspace <dir>`
 - `--non-interactive`
 - `--mode <local|remote>`
-- `--auth-choice <oauth|claude-cli|openai-codex|codex-cli|antigravity|gemini-api-key|apiKey|minimax|skip>`
+- `--auth-choice <oauth|claude-cli|token|openai-codex|openai-api-key|codex-cli|antigravity|gemini-api-key|apiKey|minimax|skip>`
 - `--anthropic-api-key <key>`
+- `--openai-api-key <key>`
 - `--gemini-api-key <key>`
 - `--gateway-port <port>`
 - `--gateway-bind <loopback|lan|tailnet|auto>`
@@ -408,6 +409,8 @@ Options:
 - `--tailscale <off|serve|funnel>`
 - `--tailscale-reset-on-exit`
 - `--allow-unconfigured`
+- `--dev`
+- `--reset`
 - `--force` (kill existing listener on port)
 - `--verbose`
 - `--ws-log <auto|full|compact>`

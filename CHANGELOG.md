@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Providers: add Microsoft Teams provider with polling, attachments, and CLI send support. (#404) — thanks @onutc
 - Commands: accept /models as an alias for /model.
 - Debugging: add raw model stream logging flags and document gateway watch mode.
 - Agent: add claude-cli/opus-4.5 runner via Claude CLI with resume support (tools disabled).
@@ -55,6 +56,8 @@
 - Onboarding: QuickStart auto-installs the Gateway daemon with Node (no runtime picker).
 - Daemon runtime: remove Bun from selection options.
 - CLI: restore hidden `gateway-daemon` alias for legacy launchd configs.
+- Onboarding/Configure: add OpenAI API key flow that stores in shared `~/.clawdbot/.env` for launchd; simplify Anthropic token prompt order.
+- Configure/Onboarding: show Control UI docs with gateway reachability status and only offer to open when a gateway is detected; default model prompt now prefers Opus 4.5 for Anthropic auth.
 - Control UI: show skill install progress + per-skill results, hide install once binaries present. (#445) — thanks @pkrmf
 - Providers/Doctor: surface Discord privileged intent (Message Content) misconfiguration with actionable warnings.
 - Providers/Doctor: warn when Telegram config expects unmentioned group messages but Bot API privacy mode is likely enabled; surface WhatsApp login/disconnect hints.
@@ -81,8 +84,10 @@
 - Commands/Tools: disable /restart and gateway restart tool by default (enable with commands.restart=true).
 - Gateway/CLI: add `clawdbot gateway discover` (Bonjour scan on `local.` + `clawdbot.internal.`) with `--timeout` and `--json`. — thanks @steipete
 - Gateway/CLI: make `clawdbot gateway status` human-readable by default, add `--json`, and probe localhost + configured remote (warn on multiple gateways). — thanks @steipete
+- Gateway/CLI: support remote loopback gateways via SSH tunnel in `clawdbot gateway status` (`--ssh` / `--ssh-auto`). — thanks @steipete
 - CLI: add global `--no-color` (and respect `NO_COLOR=1`) to disable ANSI output. — thanks @steipete
 - CLI: centralize lobster palette + apply it to onboarding/config prompts. — thanks @steipete
+- Gateway/CLI: add `clawdbot gateway --dev/--reset` to auto-create a dev config/workspace with a robot identity (no BOOTSTRAP.md). — thanks @steipete
 
 ## 2026.1.8
 
