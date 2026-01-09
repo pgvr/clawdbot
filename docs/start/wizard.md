@@ -70,8 +70,8 @@ Tip: `--json` does **not** imply non-interactive mode. Use `--non-interactive` (
      - Full reset (also removes workspace)
 
 2) **Model/Auth**
-   - **Anthropic OAuth (Claude CLI)**: if `~/.claude/.credentials.json` exists, the wizard can reuse it.
-   - **Anthropic OAuth (recommended)**: browser flow; paste the `code#state`.
+   - **Anthropic OAuth (Claude CLI)**: on macOS the wizard checks Keychain item "Claude Code-credentials" (choose "Always Allow" so launchd starts don't block); on Linux/Windows it reuses `~/.claude/.credentials.json` if present.
+   - **Anthropic token (paste setup-token)**: run `claude setup-token` in your terminal, then paste the token (you can name it; blank = default).
    - **OpenAI Codex OAuth (Codex CLI)**: if `~/.codex/auth.json` exists, the wizard can reuse it.
    - **OpenAI Codex OAuth**: browser flow; paste the `code#state`.
      - Sets `agent.model` to `openai-codex/gpt-5.2` when model is unset or `openai/*`.
@@ -120,7 +120,7 @@ Tip: `--json` does **not** imply non-interactive mode. Use `--non-interactive` (
 9) **Finish**
    - Summary + next steps, including iOS/Android/macOS apps for extra features.
   - If no GUI is detected, the wizard prints SSH port-forward instructions for the Control UI instead of opening a browser.
-  - If the Control UI assets are missing, the wizard attempts to build them; fallback is `pnpm ui:install && pnpm ui:build`.
+  - If the Control UI assets are missing, the wizard attempts to build them; fallback is `pnpm ui:build` (auto-installs UI deps).
 
 ## Remote mode
 
@@ -169,6 +169,17 @@ clawdbot onboard --non-interactive \
 ```
 
 Add `--json` for a machine‑readable summary.
+
+Gemini example:
+
+```bash
+clawdbot onboard --non-interactive \
+  --mode local \
+  --auth-choice gemini-api-key \
+  --gemini-api-key "$GEMINI_API_KEY" \
+  --gateway-port 18789 \
+  --gateway-bind loopback
+```
 
 Add agent (non‑interactive) example:
 

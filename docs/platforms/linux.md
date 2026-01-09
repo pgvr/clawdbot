@@ -6,9 +6,19 @@ read_when:
 ---
 # Linux App
 
-Clawdbot core is fully supported on Linux. The core is written in TypeScript, so it runs anywhere Node or Bun runs.
+The Gateway is fully supported on Linux. The core is written in TypeScript, so it runs anywhere Node or Bun runs.
 
-We do not have a Linux companion app yet. It is planned, and we would love contributions to make it happen.
+Native Linux companion apps are planned. Contributions are welcome if you want to help build one.
+
+## Beginner quick path (VPS)
+
+1) Install Node 22+  
+2) `npm i -g clawdbot@latest`  
+3) `clawdbot onboard --install-daemon`  
+4) From your laptop: `ssh -N -L 18789:127.0.0.1:18789 <user>@<host>`  
+5) Open `http://127.0.0.1:18789/` and paste your token
+
+Step-by-step VPS guide: [exe.dev](/platforms/exe-dev)
 
 ## Install
 - [Getting Started](/start/getting-started)
@@ -25,12 +35,6 @@ Use one of these:
 
 ```
 clawdbot onboard --install-daemon
-```
-
-Or:
-
-```
-clawdbot daemon install
 ```
 
 Or:

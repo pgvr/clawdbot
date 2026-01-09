@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 import type { Command } from "commander";
+import { gatewayStatusCommand } from "../commands/gateway-status.js";
 import {
   CONFIG_PATH_CLAWDBOT,
   type GatewayAuthMode,
@@ -22,10 +23,17 @@ import {
   setGatewayWsLogStyle,
 } from "../gateway/ws-logging.js";
 import { setVerbose } from "../globals.js";
+import type { GatewayBonjourBeacon } from "../infra/bonjour-discovery.js";
+import { discoverGatewayBeacons } from "../infra/bonjour-discovery.js";
 import { GatewayLockError } from "../infra/gateway-lock.js";
 import { formatPortDiagnostics, inspectPortUsage } from "../infra/ports.js";
-import { createSubsystemLogger } from "../logging.js";
+import { WIDE_AREA_DISCOVERY_DOMAIN } from "../infra/widearea-dns.js";
+import {
+  createSubsystemLogger,
+  setConsoleSubsystemFilter,
+} from "../logging.js";
 import { defaultRuntime } from "../runtime.js";
+import { colorize, isRich, theme } from "../terminal/theme.js";
 import { forceFreePortAndWait } from "./ports.js";
 import { withProgress } from "./progress.js";
 
@@ -35,6 +43,7 @@ type GatewayRpcOpts = {
   password?: string;
   timeout?: string;
   expectFinal?: boolean;
+  json?: boolean;
 };
 
 type GatewayRunOpts = {
@@ -48,8 +57,11 @@ type GatewayRunOpts = {
   allowUnconfigured?: boolean;
   force?: boolean;
   verbose?: boolean;
+  claudeCliLogs?: boolean;
   wsLog?: unknown;
   compact?: boolean;
+  rawStream?: boolean;
+  rawStreamPath?: unknown;
 };
 
 type GatewayRunParams = {
@@ -72,6 +84,118 @@ function parsePort(raw: unknown): number | null {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
+}
+
+const toOptionString = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint")
+    return value.toString();
+  return undefined;
+};
+
+type GatewayDiscoverOpts = {
+  timeout?: string;
+  json?: boolean;
+};
+
+function parseDiscoverTimeoutMs(raw: unknown, fallbackMs: number): number {
+  if (raw === undefined || raw === null) return fallbackMs;
+  const value =
+    typeof raw === "string"
+      ? raw.trim()
+      : typeof raw === "number" || typeof raw === "bigint"
+        ? String(raw)
+        : null;
+  if (value === null) {
+    throw new Error("invalid --timeout");
+  }
+  if (!value) return fallbackMs;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`invalid --timeout: ${value}`);
+  }
+  return parsed;
+}
+
+function pickBeaconHost(beacon: GatewayBonjourBeacon): string | null {
+  const host = beacon.tailnetDns || beacon.lanHost || beacon.host;
+  return host?.trim() ? host.trim() : null;
+}
+
+function pickGatewayPort(beacon: GatewayBonjourBeacon): number {
+  const port = beacon.gatewayPort ?? 18789;
+  return port > 0 ? port : 18789;
+}
+
+function dedupeBeacons(
+  beacons: GatewayBonjourBeacon[],
+): GatewayBonjourBeacon[] {
+  const out: GatewayBonjourBeacon[] = [];
+  const seen = new Set<string>();
+  for (const b of beacons) {
+    const host = pickBeaconHost(b) ?? "";
+    const key = [
+      b.domain ?? "",
+      b.instanceName ?? "",
+      b.displayName ?? "",
+      host,
+      String(b.port ?? ""),
+      String(b.bridgePort ?? ""),
+      String(b.gatewayPort ?? ""),
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(b);
+  }
+  return out;
+}
+
+function renderBeaconLines(
+  beacon: GatewayBonjourBeacon,
+  rich: boolean,
+): string[] {
+  const nameRaw = (
+    beacon.displayName ||
+    beacon.instanceName ||
+    "Gateway"
+  ).trim();
+  const domainRaw = (beacon.domain || "local.").trim();
+
+  const title = colorize(rich, theme.accentBright, nameRaw);
+  const domain = colorize(rich, theme.muted, domainRaw);
+
+  const parts: string[] = [];
+  if (beacon.tailnetDns)
+    parts.push(
+      `${colorize(rich, theme.info, "tailnet")}: ${beacon.tailnetDns}`,
+    );
+  if (beacon.lanHost)
+    parts.push(`${colorize(rich, theme.info, "lan")}: ${beacon.lanHost}`);
+  if (beacon.host)
+    parts.push(`${colorize(rich, theme.info, "host")}: ${beacon.host}`);
+
+  const host = pickBeaconHost(beacon);
+  const gatewayPort = pickGatewayPort(beacon);
+  const wsUrl = host ? `ws://${host}:${gatewayPort}` : null;
+
+  const firstLine =
+    parts.length > 0
+      ? `${title} ${domain} · ${parts.join(" · ")}`
+      : `${title} ${domain}`;
+
+  const lines = [`- ${firstLine}`];
+  if (wsUrl) {
+    lines.push(
+      `  ${colorize(rich, theme.muted, "ws")}: ${colorize(rich, theme.command, wsUrl)}`,
+    );
+  }
+  if (typeof beacon.sshPort === "number" && beacon.sshPort > 0 && host) {
+    const ssh = `ssh -N -L 18789:127.0.0.1:18789 <user>@${host} -p ${beacon.sshPort}`;
+    lines.push(
+      `  ${colorize(rich, theme.muted, "ssh")}: ${colorize(rich, theme.command, ssh)}`,
+    );
+  }
+  return lines;
 }
 
 function describeUnknownError(err: unknown): string {
@@ -206,9 +330,18 @@ async function runGatewayLoop(params: {
     })();
   };
 
-  const onSigterm = () => request("stop", "SIGTERM");
-  const onSigint = () => request("stop", "SIGINT");
-  const onSigusr1 = () => request("restart", "SIGUSR1");
+  const onSigterm = () => {
+    gatewayLog.info("signal SIGTERM received");
+    request("stop", "SIGTERM");
+  };
+  const onSigint = () => {
+    gatewayLog.info("signal SIGINT received");
+    request("stop", "SIGINT");
+  };
+  const onSigusr1 = () => {
+    gatewayLog.info("signal SIGUSR1 received");
+    request("restart", "SIGUSR1");
+  };
 
   process.on("SIGTERM", onSigterm);
   process.on("SIGINT", onSigint);
@@ -238,7 +371,8 @@ const gatewayCallOpts = (cmd: Command) =>
     .option("--token <token>", "Gateway token (if required)")
     .option("--password <password>", "Gateway password (password auth)")
     .option("--timeout <ms>", "Timeout in ms", "10000")
-    .option("--expect-final", "Wait for final response (agent)", false);
+    .option("--expect-final", "Wait for final response (agent)", false)
+    .option("--json", "Output JSON", false);
 
 const callGatewayCli = async (
   method: string,
@@ -249,7 +383,7 @@ const callGatewayCli = async (
     {
       label: `Gateway ${method}`,
       indeterminate: true,
-      enabled: true,
+      enabled: opts.json !== true,
     },
     async () =>
       await callGateway({
@@ -277,6 +411,10 @@ async function runGatewayCommand(
   }
 
   setVerbose(Boolean(opts.verbose));
+  if (opts.claudeCliLogs) {
+    setConsoleSubsystemFilter(["agent/claude-cli"]);
+    process.env.CLAWDBOT_CLAUDE_CLI_LOG_OUTPUT = "1";
+  }
   const wsLogRaw = (opts.compact ? "compact" : opts.wsLog) as
     | string
     | undefined;
@@ -292,6 +430,14 @@ async function runGatewayCommand(
     defaultRuntime.exit(1);
   }
   setGatewayWsLogStyle(wsLogStyle);
+
+  if (opts.rawStream) {
+    process.env.CLAWDBOT_RAW_STREAM = "1";
+  }
+  const rawStreamPath = toOptionString(opts.rawStreamPath);
+  if (rawStreamPath) {
+    process.env.CLAWDBOT_RAW_STREAM_PATH = rawStreamPath;
+  }
 
   const cfg = loadConfig();
   const portOverride = parsePort(opts.port);
@@ -338,9 +484,10 @@ async function runGatewayCommand(
     }
   }
   if (opts.token) {
-    process.env.CLAWDBOT_GATEWAY_TOKEN = String(opts.token);
+    const token = toOptionString(opts.token);
+    if (token) process.env.CLAWDBOT_GATEWAY_TOKEN = token;
   }
-  const authModeRaw = opts.auth ? String(opts.auth) : undefined;
+  const authModeRaw = toOptionString(opts.auth);
   const authMode: GatewayAuthMode | null =
     authModeRaw === "token" || authModeRaw === "password" ? authModeRaw : null;
   if (authModeRaw && !authMode) {
@@ -348,7 +495,7 @@ async function runGatewayCommand(
     defaultRuntime.exit(1);
     return;
   }
-  const tailscaleRaw = opts.tailscale ? String(opts.tailscale) : undefined;
+  const tailscaleRaw = toOptionString(opts.tailscale);
   const tailscaleMode =
     tailscaleRaw === "off" ||
     tailscaleRaw === "serve" ||
@@ -362,6 +509,8 @@ async function runGatewayCommand(
     defaultRuntime.exit(1);
     return;
   }
+  const passwordRaw = toOptionString(opts.password);
+  const tokenRaw = toOptionString(opts.token);
   const configExists = fs.existsSync(CONFIG_PATH_CLAWDBOT);
   const mode = cfg.gateway?.mode;
   if (!opts.allowUnconfigured && mode !== "local") {
@@ -377,7 +526,7 @@ async function runGatewayCommand(
     defaultRuntime.exit(1);
     return;
   }
-  const bindRaw = String(opts.bind ?? cfg.gateway?.bind ?? "loopback");
+  const bindRaw = toOptionString(opts.bind) ?? cfg.gateway?.bind ?? "loopback";
   const bind =
     bindRaw === "loopback" ||
     bindRaw === "tailnet" ||
@@ -398,8 +547,8 @@ async function runGatewayCommand(
   const authConfig = {
     ...cfg.gateway?.auth,
     ...(authMode ? { mode: authMode } : {}),
-    ...(opts.password ? { password: String(opts.password) } : {}),
-    ...(opts.token ? { token: String(opts.token) } : {}),
+    ...(passwordRaw ? { password: passwordRaw } : {}),
+    ...(tokenRaw ? { token: tokenRaw } : {}),
   };
   const resolvedAuth = resolveGatewayAuth({
     authConfig,
@@ -467,11 +616,11 @@ async function runGatewayCommand(
         await startGatewayServer(port, {
           bind,
           auth:
-            authMode || opts.password || opts.token || authModeRaw
+            authMode || passwordRaw || tokenRaw || authModeRaw
               ? {
                   mode: authMode ?? undefined,
-                  token: opts.token ? String(opts.token) : undefined,
-                  password: opts.password ? String(opts.password) : undefined,
+                  token: tokenRaw,
+                  password: passwordRaw,
                 }
               : undefined,
           tailscale:
@@ -550,11 +699,18 @@ function addGatewayRunCommand(
     )
     .option("--verbose", "Verbose logging to stdout/stderr", false)
     .option(
+      "--claude-cli-logs",
+      "Only show claude-cli logs in the console (includes stdout/stderr)",
+      false,
+    )
+    .option(
       "--ws-log <style>",
       'WebSocket log style ("auto"|"full"|"compact")',
       "auto",
     )
     .option("--compact", 'Alias for "--ws-log compact"', false)
+    .option("--raw-stream", "Log raw model stream events to jsonl", false)
+    .option("--raw-stream-path <path>", "Raw stream jsonl path")
     .action(async (opts) => {
       await runGatewayCommand(opts, params);
     });
@@ -576,7 +732,7 @@ export function registerGatewayCli(program: Command) {
   gatewayCallOpts(
     gateway
       .command("call")
-      .description("Call a Gateway method and print JSON")
+      .description("Call a Gateway method")
       .argument(
         "<method>",
         "Method name (health/status/system-presence/cron.*)",
@@ -586,6 +742,18 @@ export function registerGatewayCli(program: Command) {
         try {
           const params = JSON.parse(String(opts.params ?? "{}"));
           const result = await callGatewayCli(method, opts, params);
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(result, null, 2));
+            return;
+          }
+          const rich = isRich();
+          defaultRuntime.log(
+            `${colorize(rich, theme.heading, "Gateway call")}: ${colorize(
+              rich,
+              theme.muted,
+              String(method),
+            )}`,
+          );
           defaultRuntime.log(JSON.stringify(result, null, 2));
         } catch (err) {
           defaultRuntime.error(`Gateway call failed: ${String(err)}`);
@@ -601,7 +769,46 @@ export function registerGatewayCli(program: Command) {
       .action(async (opts) => {
         try {
           const result = await callGatewayCli("health", opts);
-          defaultRuntime.log(JSON.stringify(result, null, 2));
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(result, null, 2));
+            return;
+          }
+          const rich = isRich();
+          const obj =
+            result && typeof result === "object"
+              ? (result as Record<string, unknown>)
+              : {};
+          const durationMs =
+            typeof obj.durationMs === "number" ? obj.durationMs : null;
+          defaultRuntime.log(colorize(rich, theme.heading, "Gateway Health"));
+          defaultRuntime.log(
+            `${colorize(rich, theme.success, "OK")}${
+              durationMs != null ? ` (${durationMs}ms)` : ""
+            }`,
+          );
+          if (obj.web && typeof obj.web === "object") {
+            const web = obj.web as Record<string, unknown>;
+            const linked = web.linked === true;
+            defaultRuntime.log(
+              `Web: ${linked ? "linked" : "not linked"}${
+                typeof web.authAgeMs === "number" && linked
+                  ? ` (${Math.round(web.authAgeMs / 60_000)}m)`
+                  : ""
+              }`,
+            );
+          }
+          if (obj.telegram && typeof obj.telegram === "object") {
+            const tg = obj.telegram as Record<string, unknown>;
+            defaultRuntime.log(
+              `Telegram: ${tg.configured === true ? "configured" : "not configured"}`,
+            );
+          }
+          if (obj.discord && typeof obj.discord === "object") {
+            const dc = obj.discord as Record<string, unknown>;
+            defaultRuntime.log(
+              `Discord: ${dc.configured === true ? "configured" : "not configured"}`,
+            );
+          }
         } catch (err) {
           defaultRuntime.error(String(err));
           defaultRuntime.exit(1);
@@ -609,18 +816,96 @@ export function registerGatewayCli(program: Command) {
       }),
   );
 
-  gatewayCallOpts(
-    gateway
-      .command("status")
-      .description("Fetch Gateway status")
-      .action(async (opts) => {
-        try {
-          const result = await callGatewayCli("status", opts);
-          defaultRuntime.log(JSON.stringify(result, null, 2));
-        } catch (err) {
-          defaultRuntime.error(String(err));
-          defaultRuntime.exit(1);
+  gateway
+    .command("status")
+    .description(
+      "Show gateway reachability + discovery + health + status summary (local + remote)",
+    )
+    .option(
+      "--url <url>",
+      "Explicit Gateway WebSocket URL (still probes localhost)",
+    )
+    .option("--token <token>", "Gateway token (applies to all probes)")
+    .option("--password <password>", "Gateway password (applies to all probes)")
+    .option("--timeout <ms>", "Overall probe budget in ms", "3000")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      try {
+        await gatewayStatusCommand(opts, defaultRuntime);
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  gateway
+    .command("discover")
+    .description(
+      `Discover gateways via Bonjour (multicast local. + unicast ${WIDE_AREA_DISCOVERY_DOMAIN})`,
+    )
+    .option("--timeout <ms>", "Per-command timeout in ms", "2000")
+    .option("--json", "Output JSON", false)
+    .action(async (opts: GatewayDiscoverOpts) => {
+      try {
+        const timeoutMs = parseDiscoverTimeoutMs(opts.timeout, 2000);
+        const beacons = await withProgress(
+          {
+            label: "Scanning for gateways…",
+            indeterminate: true,
+            enabled: opts.json !== true,
+          },
+          async () => await discoverGatewayBeacons({ timeoutMs }),
+        );
+
+        const deduped = dedupeBeacons(beacons).sort((a, b) =>
+          String(a.displayName || a.instanceName).localeCompare(
+            String(b.displayName || b.instanceName),
+          ),
+        );
+
+        if (opts.json) {
+          const enriched = deduped.map((b) => {
+            const host = pickBeaconHost(b);
+            const port = pickGatewayPort(b);
+            return {
+              ...b,
+              wsUrl: host ? `ws://${host}:${port}` : null,
+            };
+          });
+          defaultRuntime.log(
+            JSON.stringify(
+              {
+                timeoutMs,
+                domains: ["local.", WIDE_AREA_DISCOVERY_DOMAIN],
+                count: enriched.length,
+                beacons: enriched,
+              },
+              null,
+              2,
+            ),
+          );
+          return;
         }
-      }),
-  );
+
+        const rich = isRich();
+        defaultRuntime.log(colorize(rich, theme.heading, "Gateway Discovery"));
+        defaultRuntime.log(
+          colorize(
+            rich,
+            theme.muted,
+            `Found ${deduped.length} gateway(s) · domains: local., ${WIDE_AREA_DISCOVERY_DOMAIN}`,
+          ),
+        );
+        if (deduped.length === 0) return;
+
+        for (const beacon of deduped) {
+          for (const line of renderBeaconLines(beacon, rich)) {
+            defaultRuntime.log(line);
+          }
+        }
+      } catch (err) {
+        defaultRuntime.error(`gateway discover failed: ${String(err)}`);
+        defaultRuntime.exit(1);
+      }
+    });
 }
